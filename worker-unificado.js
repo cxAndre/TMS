@@ -329,7 +329,7 @@ function extrairDatasConsolidadas(ocorrencias) {
     if (status === '123' || status === '100' || (!temCod && desc.includes('EMISSAO REALIZADA')))                               datas.dt_emissao_edi   = data;
     if (status === '111' || (!temCod && desc.includes('HUB DA TRANSPORTADORA')))                                               datas.dt_hub_conferido = data;
     if (status === '103' || (!temCod && desc.includes('SAIDA EFETIVA')))                                                       datas.dt_saida_efetiva = data;
-    if (status === '165' || status === '99' || (!temCod && (desc.includes('MANIFESTADO') || desc.includes('TRANSFERENCIA') || desc.includes('EM TRANSFERENCIA'))))  datas.dt_em_transito   = data;
+    if (status === '165' || status === '99' || status === '215' || (!temCod && (desc.includes('MANIFESTADO') || desc.includes('TRANSFERENCIA') || desc.includes('EM TRANSFERENCIA') || desc.includes('ROTA DE ENTREGA'))))  datas.dt_em_transito   = data;
     if (status === '1'   || status === '02' || (!temCod && desc.includes('ENTREGA REALIZADA')))                               datas.dt_entregue      = data;
     if (status === '105' || (!temCod && desc.includes('COMPROVANTE DE ENTREGA')))                                             datas.dt_canhoto       = data;
     if (status === '199' || status === '07' || status === '25' || (!temCod && (desc.includes('DEVOLVIDA') || desc.includes('DEVOLUCAO'))))  datas.dt_devolucao     = data;
@@ -711,7 +711,7 @@ async function processarFluxoQedb(execucao_id) {
       if (dtFallback) {
         if ((codUltima === '01' || codUltima === '02') && !datas.dt_entregue)   datas.dt_entregue  = dtFallback;
         if ((codUltima === '07' || codUltima === '25') && !datas.dt_devolucao)  datas.dt_devolucao = dtFallback;
-        if (codUltima === '99' && !datas.dt_em_transito)                        datas.dt_em_transito = dtFallback;
+        if ((codUltima === '99' || codUltima === '215') && !datas.dt_em_transito) datas.dt_em_transito = dtFallback;
       }
 
       regs.push(montarRegistro({
