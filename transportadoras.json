@@ -1,0 +1,42 @@
+{
+  "transportadoras": [
+    {
+      "name": "BRUDAM-ACERTA-EXPRESS",
+      "base": "https://acertaexpress.brudam.com.br",
+      "auth_url": "https://acertaexpress.brudam.com.br/api/v1/acesso/auth/login",
+      "cnpjs": [
+        "28486039000180",
+        "28486039000260",
+        "28486039000341"
+      ],
+      "accounts": [
+        {
+          "user_env": "BRUDAM_ACERTA_USER1",
+          "pass_env": "BRUDAM_ACERTA_PASS1"
+        },
+        {
+          "user_env": "BRUDAM_ACERTA_USER2",
+          "pass_env": "BRUDAM_ACERTA_PASS2"
+        }
+      ]
+    },
+    {
+      "name": "BRUDAM-DDMLOG",
+      "base": "https://ddmlog.brudam.com.br",
+      "auth_url": "https://ddmlog.brudam.com.br/api/v1/acesso/auth/login",
+      "cnpjs": [
+        "19355089000137"
+      ],
+      "accounts": [
+        {
+          "user_env": "BRUDAM_DDMLOG_USER1",
+          "pass_env": "BRUDAM_DDMLOG_PASS1"
+        },
+        {
+          "user_env": "BRUDAM_DDMLOG_USER2",
+          "pass_env": "BRUDAM_DDMLOG_PASS2"
+        }
+      ]
+    }
+  ]
+}
