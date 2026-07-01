@@ -78,13 +78,6 @@ function tryDecodeBase64Json(value) {
   try { const d = Buffer.from(value, 'base64').toString('utf-8').trim(); if (d.startsWith('{') || d.startsWith('[')) return JSON.parse(d); return d; } catch { return value; }
 }
 
-function parseDataProtheusYYYYMMDD(data) {
-  if (!data) return null;
-  const v = String(data).trim();
-  if (!/^\d{8}$/.test(v)) return null;
-  return `${v.substring(0,4)}-${v.substring(4,6)}-${v.substring(6,8)}T00:00:00-03:00`;
-}
-
 // ─── EMPRESAS ─────────────────────────────────────────────────────────────────
 const EMPRESAS_PROTHEUS = [
   { sufixo: '030', empresa_id: 'VILLE'    },
@@ -158,8 +151,7 @@ function buildQueryQedb(sufixo, empresaId, inListNf, inListSerie) {
       dest.razao_destinatario,
       dest.cnpj_destinatario,
       dest.municipio_destino,
-      dest.uf_destino,
-      dest.previsao_entrega
+      dest.uf_destino
     FROM (
       SELECT DISTINCT
         LTRIM(RTRIM(f.F2_FILIAL)) AS F2_FILIAL_LTRIM,
@@ -184,11 +176,9 @@ function buildQueryQedb(sufixo, empresaId, inListNf, inListSerie) {
         MAX(LTRIM(RTRIM(c.A1_NOME))) AS razao_destinatario,
         MAX(LTRIM(RTRIM(c.A1_CGC)))  AS cnpj_destinatario,
         MAX(LTRIM(RTRIM(c.A1_MUN)))  AS municipio_destino,
-        MAX(LTRIM(RTRIM(c.A1_EST)))  AS uf_destino,
-        MIN(ped.C5_XENTREG)          AS previsao_entrega
+        MAX(LTRIM(RTRIM(c.A1_EST)))  AS uf_destino
       FROM SD2${sufixo} d
       LEFT JOIN SA1${sufixo} c   ON c.A1_FILIAL  = d.D2_FILIAL AND c.A1_COD   = d.D2_CLIENTE AND c.A1_LOJA = d.D2_LOJA AND c.D_E_L_E_T_ = ''
-      LEFT JOIN SC5${sufixo} ped ON ped.C5_FILIAL = d.D2_FILIAL AND ped.C5_NUM = d.D2_PEDIDO AND ped.D_E_L_E_T_ = ''
       WHERE d.D_E_L_E_T_ = ''
         AND LTRIM(RTRIM(d.D2_DOC))   IN (${fmtNfs})
         AND LTRIM(RTRIM(d.D2_SERIE)) IN (${fmtSeries})
@@ -734,7 +724,7 @@ async function processarFluxoQedb(execucao_id) {
         codigo_representante: row.codigo_representante || null,
         modal_transporte: 'RODOVIARIO',
         valor_nf: row.valor_nf || null,
-        previsao_entrega: parseDataProtheusYYYYMMDD(row.previsao_entrega),
+        previsao_entrega: null, // QEDB não fornece previsão de entrega — não usar Protheus como fallback
         execucao_id, ingest_source: 'API_QEDB',
         ultima_ocorrencia_codigo: ultimaOc.codigoOcorrencia ? String(ultimaOc.codigoOcorrencia) : null,
         ultima_ocorrencia_data: parseDataHoraQedb(ultimaOc.chegadaDestino?.data, ultimaOc.chegadaDestino?.hora)
