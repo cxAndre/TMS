@@ -6,6 +6,8 @@
 const path = require('path');
 require('dotenv').config({ path: path.join(__dirname, '.env') });
 const { buscarOcorrenciasQedb } = require('./qedb');
+const { gravarXmlEmLote } = require('./xml-completo');
+const { buscarLoteCteBrudam, mapearCtePorNota } = require('./cte-brudam');
 
 const VARS_OBRIGATORIAS = [
   'SUPABASE_URL', 'SUPABASE_KEY',
@@ -505,6 +507,23 @@ async function processarTransportadoraBrudam(t, execucao_id) {
         }
 
         stats.novas += await salvarRegistros(registros);
+
+        // xml_completo: XML fiscal do CT-e (Brudam /dfe/cte/nota), por chave da NF-e
+        try {
+          const tokenCte = await getBrudamToken(account, config.auth_url);
+          const itensCte = await buscarLoteCteBrudam(loteChaves, config.base, tokenCte);
+          const mapaCte  = mapearCtePorNota(loteChaves, itensCte);
+          const cteUpdates = [];
+          for (const row of loteRows) {
+            const cte = mapaCte.get(String(row.f2_chvnfe).trim());
+            if (cte?.xml) cteUpdates.push({ empresa_id: row.empresa_id, filial: row.filial, chave_nfe: String(row.f2_chvnfe).trim(), xml: cte.xml });
+          }
+          const grav = await gravarXmlEmLote(supabase, cteUpdates, logger);
+          logger.debug({ transportadora: t.name, cte_gravados: grav }, 'CT-e XML atualizado');
+        } catch (errCte) {
+          logger.warn({ transportadora: t.name, err: errCte.message }, 'CT-e: falha ao buscar/gravar XML do lote (segue)');
+        }
+
         processado = true; break;
 
       } catch (err) {
@@ -609,6 +628,7 @@ async function processarEmpresaEsl(origemNome, credencial, sinceFormatted, execu
   }
 
   const inseridos = await salvarRegistros(registros);
+  // xml_completo (CT-e) para ESL fica na Fase 2 — não gravado aqui.
   logger.info({ empresa: origemNome, inseridos }, 'ESL: finalizada');
   return inseridos;
 }
@@ -735,7 +755,11 @@ async function processarFluxoQedb(execucao_id) {
       }));
     }
 
-    if (regs.length > 0) { await salvarRegistros(regs); total += regs.length; }
+    if (regs.length > 0) {
+      await salvarRegistros(regs);
+      total += regs.length;
+      // xml_completo (CT-e) para QEDB fica na Fase 2 — não gravado aqui.
+    }
   }
   return total;
 }

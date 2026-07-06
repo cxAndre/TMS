@@ -1,0 +1,40 @@
+name: TMS ETL
+
+# Roda automaticamente por agendamento + botão manual.
+on:
+  schedule:
+    # Cron em UTC. Brasil = UTC-3. '0 * * * *' = de hora em hora.
+    # Exemplos: '0 */2 * * *' a cada 2h | '0 9-21 * * *' das 6h às 18h BRT.
+    - cron: '0 * * * *'
+  workflow_dispatch: {}   # permite rodar na mão pela aba Actions
+
+# Evita duas execuções simultâneas (o worker já barra, isto é reforço).
+concurrency:
+  group: tms-etl
+  cancel-in-progress: false
+
+jobs:
+  etl:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout do código
+        uses: actions/checkout@v4
+
+      - name: Instalar Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Instalar dependências
+        run: npm ci
+
+      - name: Recriar .env a partir do secret
+        run: |
+          cat > .env <<'DOTENV_EOF'
+          ${{ secrets.DOTENV }}
+          DOTENV_EOF
+
+      - name: Rodar ETL
+        run: npm start
