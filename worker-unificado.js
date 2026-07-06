@@ -790,12 +790,14 @@ async function main() {
 
   const execucao_id = execData.execucao_id;
   const stats = { total_notas_lidas: 0, total_notas_consultadas: 0, total_novas: 0, total_erros: 0 };
+  let falhasEtapa = 0; // etapas inteiras que lançaram exceção (Brudam/ESL/QEDB)
+  const LIMIAR_ERROS = parseInt(process.env.ALERTA_LIMIAR_ERROS || '0', 10); // acima disso, run falha
 
   async function finalizar(status) {
     if (mssqlPool.connected) await mssqlPool.close().catch(() => {});
     const { error } = await supabase.from('sync_execucoes').update({ fim_em: new Date().toISOString(), ...stats, status_execucao: status }).eq('execucao_id', execucao_id);
     if (error) logger.error({ err: error.message }, 'Falha status final');
-    else       logger.info({ ...stats, status }, '✅ ETL finalizado');
+    else       logger.info({ ...stats, status }, status === 'FINALIZADO' ? '✅ ETL finalizado' : `⚠️ ETL finalizado (${status})`);
   }
 
   for (const sig of ['SIGTERM','SIGINT']) process.once(sig, () => finalizar('ABORTADO').finally(() => process.exit(0)));
@@ -804,7 +806,7 @@ async function main() {
     logger.info({ total: transportadoras.length }, '── Brudam ──');
     for (const t of transportadoras) {
       try { const s = await processarTransportadoraBrudam(t, execucao_id); stats.total_notas_lidas += s.notas_lidas; stats.total_notas_consultadas += s.consultadas; stats.total_novas += s.novas; stats.total_erros += s.erros; }
-      catch (err) { logger.error({ transportadora: t.name, err: err.message }, 'Brudam: erro'); }
+      catch (err) { falhasEtapa++; logger.error({ transportadora: t.name, err: err.message }, 'Brudam: erro'); }
     }
 
     const dataCorte = new Date(); dataCorte.setDate(dataCorte.getDate() - ESL_JANELA_DIAS);
@@ -812,14 +814,21 @@ async function main() {
     logger.info({ total: EMPRESAS_ESL.length, since }, '── ESL ──');
     for (const emp of EMPRESAS_ESL) {
       try { stats.total_novas += await processarEmpresaEsl(emp.nome, emp, since, execucao_id); }
-      catch (err) { logger.error({ empresa: emp.nome, err: err.message }, 'ESL: erro'); }
+      catch (err) { falhasEtapa++; logger.error({ empresa: emp.nome, err: err.message }, 'ESL: erro'); }
     }
 
     logger.info('── QEDB ──');
     try { const n = await processarFluxoQedb(execucao_id); stats.total_novas += n; logger.info({ inseridos: n }, 'QEDB ok'); }
-    catch (err) { logger.error({ err: err.message }, 'QEDB: erro'); }
+    catch (err) { falhasEtapa++; logger.error({ err: err.message }, 'QEDB: erro'); }
 
-    await finalizar('FINALIZADO');
+    // Fail-loud: run fica vermelho (exit 1) se alguma etapa quebrou ou os erros
+    // passaram do limiar — assim o alerta (e-mail/notificação) realmente dispara.
+    const houveErroCritico = falhasEtapa > 0 || stats.total_erros > LIMIAR_ERROS;
+    await finalizar(houveErroCritico ? 'ERRO' : 'FINALIZADO');
+    if (houveErroCritico) {
+      logger.error({ falhas_etapa: falhasEtapa, total_erros: stats.total_erros, limiar: LIMIAR_ERROS }, '❌ ETL terminou COM ERROS — marcando execução como falha');
+      process.exitCode = 1;
+    }
   } catch (err) { logger.error({ err: err.message }, 'Erro crítico'); await finalizar('ERRO'); throw err; }
 }
 
