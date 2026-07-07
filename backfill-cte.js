@@ -38,8 +38,8 @@ function resolverCarriers() {
     const acc = (t.accounts || [])
       .map(a => ({ user: a.user || process.env[a.user_env], pass: a.pass || process.env[a.pass_env] }))
       .filter(a => a.user && a.pass);
-    return { name: t.name, base: t.base, authUrl: t.auth_url, account: acc[0] };
-  }).filter(t => t.account && t.base && t.authUrl);
+    return { name: t.name, base: t.base, authUrl: t.auth_url, accounts: acc };
+  }).filter(t => t.accounts.length && t.base && t.authUrl);
 }
 
 // Atualiza xml_completo (define o valor OU null) — usado tanto p/ gravar CT-e
@@ -93,8 +93,7 @@ async function coletarAlvos(carrier) {
 }
 
 async function backfillCarrier(carrier) {
-  const cliente = criarClienteCteBrudam({ base: carrier.base, authUrl: carrier.authUrl, user: carrier.account.user, pass: carrier.account.pass });
-  await cliente.autenticar();
+  const cliente = criarClienteCteBrudam({ base: carrier.base, authUrl: carrier.authUrl, accounts: carrier.accounts });
 
   const alvos = await coletarAlvos(carrier);
   let processadas = 0, comCte = 0, semCte = 0;

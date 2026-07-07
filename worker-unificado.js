@@ -7,7 +7,7 @@ const path = require('path');
 require('dotenv').config({ path: path.join(__dirname, '.env') });
 const { buscarOcorrenciasQedb } = require('./qedb');
 const { gravarXmlEmLote } = require('./xml-completo');
-const { buscarLoteCteBrudam, mapearCtePorNota } = require('./cte-brudam');
+const { criarClienteCteBrudam } = require('./cte-brudam');
 
 const VARS_OBRIGATORIAS = [
   'SUPABASE_URL', 'SUPABASE_KEY',
@@ -438,6 +438,7 @@ async function processarTransportadoraBrudam(t, execucao_id) {
   }
   const stats = { notas_lidas: 0, consultadas: 0, novas: 0, erros: 0 };
   const config = { base: t.base, auth_url: t.auth_url };
+  const clienteCte = criarClienteCteBrudam({ base: t.base, authUrl: t.auth_url, accounts: t.accounts });
   const [keys] = await Promise.all([
     buscarChavesProtheus_Brudam(t.cnpjs, t.name),
     Promise.allSettled(t.accounts.map(acc => getBrudamToken(acc, config.auth_url))),
@@ -510,9 +511,7 @@ async function processarTransportadoraBrudam(t, execucao_id) {
 
         // xml_completo: XML fiscal do CT-e (Brudam /dfe/cte/nota), por chave da NF-e
         try {
-          const tokenCte = await getBrudamToken(account, config.auth_url);
-          const itensCte = await buscarLoteCteBrudam(loteChaves, config.base, tokenCte);
-          const mapaCte  = mapearCtePorNota(loteChaves, itensCte);
+          const mapaCte = await clienteCte.buscar(loteChaves);
           const cteUpdates = [];
           for (const row of loteRows) {
             const cte = mapaCte.get(String(row.f2_chvnfe).trim());

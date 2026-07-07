@@ -53,28 +53,49 @@ function mapearCtePorNota(chavesPedidas, itens) {
   return mapa;
 }
 
-// Cliente autônomo (usado no backfill) — gerencia o token e reautentica no 401.
-function criarClienteCteBrudam({ base, authUrl, user, pass }) {
-  let token = null;
-  async function autenticar() {
-    const r = await axios.post(authUrl, { usuario: user, senha: pass }, {
+// Cliente que tenta TODAS as contas e usa a que libera o XML.
+// Motivo: em alguns Brudam (ex.: DDM) só uma das contas tem permissão de
+// download de XML de CT-e; a outra devolve status 0 "Proibido".
+function criarClienteCteBrudam({ base, authUrl, accounts, user, pass }) {
+  // aceita accounts:[{user,pass}] ou o par avulso {user,pass} (compat)
+  const contas = (accounts && accounts.length ? accounts : [{ user, pass }])
+    .filter(a => a && a.user && a.pass);
+  const tokens = new Map(); // user -> token
+
+  async function autenticar(conta) {
+    const r = await axios.post(authUrl, { usuario: conta.user, senha: conta.pass }, {
       headers: { 'Content-Type': 'application/json' }, timeout: 60000, validateStatus: () => true,
     });
-    token = r.data?.data?.access_key || r.data?.token || r.data?.tokenjwt || r.data?.access_token || r.data?.data?.token;
+    const token = r.data?.data?.access_key || r.data?.token || r.data?.tokenjwt || r.data?.access_token || r.data?.data?.token;
     if (!token) throw new Error('Token Brudam não obtido');
+    tokens.set(conta.user, token);
     return token;
   }
-  async function buscar(chaves, _tent = 0) {
-    if (!token) await autenticar();
-    try {
-      const itens = await buscarLoteCteBrudam(chaves, base, token);
-      return mapearCtePorNota(chaves, itens);
-    } catch (e) {
-      if (e.status === 401 && _tent < 1) { await autenticar(); return buscar(chaves, _tent + 1); }
+
+  async function chamarConta(conta, chaves, _reauth = false) {
+    const token = tokens.get(conta.user) || await autenticar(conta);
+    try { return await buscarLoteCteBrudam(chaves, base, token); }
+    catch (e) {
+      if (e.status === 401 && !_reauth) { await autenticar(conta); return chamarConta(conta, chaves, true); }
       throw e;
     }
   }
-  return { autenticar, buscar };
+
+  async function buscar(chaves) {
+    let ultimoItens = [];
+    for (const conta of contas) {
+      let itens;
+      try { itens = await chamarConta(conta, chaves); }
+      catch { continue; } // conta falhou → tenta a próxima
+      ultimoItens = itens;
+      // se esta conta liberou algum XML, é a boa
+      if (itens.some(it => it.status === 1 && it.xml)) return mapearCtePorNota(chaves, itens);
+    }
+    // nenhuma conta liberou XML (Proibido ou sem CT-e) → mapeia o que houver
+    return mapearCtePorNota(chaves, ultimoItens);
+  }
+
+  return { buscar };
 }
 
 module.exports = { buscarLoteCteBrudam, mapearCtePorNota, criarClienteCteBrudam, LIMITE_CHAVES };
