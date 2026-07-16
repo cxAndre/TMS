@@ -67,21 +67,55 @@ async function resolverLinhas(supabase, chaves, lote = 100) {
 }
 
 // ─── FLUXO ───────────────────────────────────────────────────────────────────
-function configPvn() {
+// O ssh2 rejeita a chave ("Unsupported key format") por detalhes que a viagem
+// terminal → área de transferência → secret costuma introduzir: CR do Windows,
+// espaço nas pontas, e principalmente a falta da quebra de linha final.
+// Aceita também a chave em base64, que imuniza contra mangling de quebra.
+function normalizarChave(bruta) {
+  let k = bruta.trim();
+  if (!k.includes('-----BEGIN')) {
+    try {
+      const decodificada = Buffer.from(k, 'base64').toString('utf8');
+      if (decodificada.includes('-----BEGIN')) k = decodificada.trim();
+    } catch { /* não era base64; segue com o valor original */ }
+  }
+  return k.replace(/\r/g, '') + '\n';
+}
+
+// Só a forma da chave, nunca o conteúdo — serve para diagnosticar sem vazar.
+function formaDaChave(k) {
+  return {
+    linhas: k.split('\n').filter(Boolean).length,
+    comeca_ok: k.startsWith('-----BEGIN'),
+    termina_ok: /-----END [^\n]*-----\n$/.test(k),
+    bytes: k.length,
+  };
+}
+
+function configPvn(logger) {
   const host = process.env.PVN_SFTP_HOST;
-  const key  = process.env.PVN_SFTP_KEY;
-  if (!host || !key) return null; // etapa opcional: sem config, não roda
+  const bruta = process.env.PVN_SFTP_KEY;
+  if (!host || !bruta) return null; // etapa opcional: sem config, não roda
+
+  const privateKey = normalizarChave(bruta);
+  const forma = formaDaChave(privateKey);
+  if (!forma.comeca_ok || !forma.termina_ok || forma.linhas < 3) {
+    logger.error(forma, 'PVN: chave malformada — o secret PVN_SFTP_KEY não tem a cara de uma chave OpenSSH');
+  } else {
+    logger.info(forma, 'PVN: chave carregada');
+  }
+
   return {
     host,
     port: parseInt(process.env.PVN_SFTP_PORT || '22', 10),
     username: process.env.PVN_SFTP_USER || 'pvn',
-    privateKey: key,
+    privateKey,
     readyTimeout: parseInt(process.env.PVN_SFTP_TIMEOUT || '20000', 10),
   };
 }
 
 async function processarPastaPvn(supabase, logger) {
-  const cfg = configPvn();
+  const cfg = configPvn(logger);
   if (!cfg) { logger.info('PVN: sem PVN_SFTP_HOST/PVN_SFTP_KEY — etapa pulada'); return 0; }
 
   const sftp = new SftpClient();
@@ -165,4 +199,4 @@ async function processarPastaPvn(supabase, logger) {
   }
 }
 
-module.exports = { processarPastaPvn, extrairChavesNfe, xmlCompleto, ehCte, resolverLinhas };
+module.exports = { processarPastaPvn, extrairChavesNfe, xmlCompleto, ehCte, resolverLinhas, normalizarChave, formaDaChave };
