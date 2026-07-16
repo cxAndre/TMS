@@ -20,6 +20,7 @@ const axios  = require('axios');
 const sql    = require('mssql');
 const pino   = require('pino');
 const fs     = require('fs');
+const net    = require('net');
 const { createClient } = require('@supabase/supabase-js');
 
 const logger = pino({
@@ -41,12 +42,57 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY
   global: { fetch: (url, options = {}) => fetch(url, { ...options, signal: AbortSignal.timeout(90_000) }) },
 });
 
+const MSSQL_PORTA   = parseInt(process.env.MSSQL_PORT || '1433', 10);
+const MSSQL_TIMEOUT = parseInt(process.env.MSSQL_TIMEOUT || '30000', 10);
+
 const mssqlPool = new sql.ConnectionPool({
   user: process.env.MSSQL_USER, password: process.env.MSSQL_PASS,
   server: process.env.MSSQL_HOST, database: process.env.MSSQL_DB,
+  port: MSSQL_PORTA,
+  connectionTimeout: MSSQL_TIMEOUT,
+  requestTimeout: parseInt(process.env.MSSQL_REQ_TIMEOUT || '60000', 10),
   pool: { max: 5, min: 1, idleTimeoutMillis: 30000 },
   options: { encrypt: false, trustServerCertificate: true }
 });
+
+// ─── DIAGNÓSTICO DE CONEXÃO MSSQL ─────────────────────────────────────────────
+// O erro do driver ("Failed to connect ... in 15000ms") não distingue rota
+// bloqueada de falha de login. Sonda a porta crua e registra o IP de saída do
+// runner — é o dado que o responsável pelo firewall do Protheus precisa.
+function sondarTcp(host, porta, timeoutMs) {
+  return new Promise(resolve => {
+    const socket = new net.Socket();
+    const inicio = Date.now();
+    let respondido = false;
+    const encerrar = r => {
+      if (respondido) return;
+      respondido = true;
+      socket.destroy();
+      resolve({ ...r, ms: Date.now() - inicio });
+    };
+    socket.setTimeout(timeoutMs);
+    socket.once('connect', () => encerrar({ ok: true }));
+    socket.once('timeout', () => encerrar({ ok: false, motivo: 'timeout' }));
+    socket.once('error', err => encerrar({ ok: false, motivo: err.code || err.message }));
+    socket.connect(porta, host);
+  });
+}
+
+async function ipDeSaida() {
+  try { return (await axios.get('https://api.ipify.org', { timeout: 5000 })).data; }
+  catch { return 'desconhecido'; }
+}
+
+async function diagnosticarMssql(host) {
+  const [ip, sonda] = await Promise.all([ipDeSaida(), sondarTcp(host, MSSQL_PORTA, MSSQL_TIMEOUT)]);
+  const base = { ip_saida: ip, host, porta: MSSQL_PORTA, sonda_ms: sonda.ms };
+  if (sonda.ok) {
+    logger.error(base, 'Diagnóstico: porta ABRIU na sondagem — rota ok, falha é de login/driver, não de firewall');
+  } else {
+    logger.error({ ...base, motivo: sonda.motivo },
+      'Diagnóstico: porta INALCANÇÁVEL deste runner — liberar o ip_saida acima no firewall do Protheus');
+  }
+}
 
 // ─── UTILITÁRIOS ──────────────────────────────────────────────────────────────
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -778,8 +824,12 @@ async function main() {
     { nome: 'SF2030 (VILLE)',    tenant: process.env.ESL_TENANT, token: process.env.ESL_TOKEN_VILLE,    sufixo: '030', empresa_id: 'VILLE'    },
   ];
 
-  try { await mssqlPool.connect(); logger.info('MSSQL conectado'); }
-  catch (err) { logger.error({ err: err.message }, 'Falha MSSQL'); process.exit(1); }
+  try { await mssqlPool.connect(); logger.info({ host: process.env.MSSQL_HOST, porta: MSSQL_PORTA }, 'MSSQL conectado'); }
+  catch (err) {
+    logger.error({ err: err.message, code: err.code, timeout_ms: MSSQL_TIMEOUT }, 'Falha MSSQL');
+    await diagnosticarMssql(process.env.MSSQL_HOST);
+    process.exit(1);
+  }
 
   const { data: execData, error: execErr } = await supabase.from('sync_execucoes').insert([{ empresa_id: 'MULTI', status_execucao: 'PROCESSANDO' }]).select().single();
   if (execErr) {
