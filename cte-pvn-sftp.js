@@ -25,6 +25,10 @@ const TTL_INVALIDO_MS = parseInt(process.env.PVN_TTL_INVALIDO_MS || String(60 * 
 // CT-e válido cuja NF-e ainda não entrou no monitoramento → segura e tenta de novo.
 // Passado o prazo, desiste. O CT-e pode legitimamente chegar antes da NF-e.
 const TTL_SEM_LINHA_MS = parseInt(process.env.PVN_TTL_SEM_LINHA_MS || String(24 * 60 * 60 * 1000), 10);
+// Teto por execução: uma carga histórica da PVN pode despejar milhares de
+// arquivos de uma vez, e o job do Actions tem limite de tempo. Os mais antigos
+// vão primeiro; o resto fica para o próximo run (de hora em hora).
+const MAX_ARQUIVOS = parseInt(process.env.PVN_MAX_ARQUIVOS || '300', 10);
 
 // ─── VALIDAÇÃO / EXTRAÇÃO ────────────────────────────────────────────────────
 // Um XML cortado no meio do upload não tem a tag de fechamento. É verificação
@@ -64,6 +68,28 @@ async function resolverLinhas(supabase, chaves, lote = 100) {
     mapa.get(l.chave_nfe).push({ empresa_id: l.empresa_id, filial: l.filial });
   }
   return mapa;
+}
+
+// ─── MOVIMENTAÇÃO ────────────────────────────────────────────────────────────
+// rename do SFTP FALHA se o destino já existir (por isso a lib expõe um
+// posixRename à parte). A PVN pode reenviar o mesmo nome — sem tratar, o arquivo
+// nunca sai da upload/ e volta a ser processado em todo run, para sempre.
+// Preserva os dois: o reenvio ganha sufixo em vez de sobrescrever o original.
+async function moverArquivo(sftp, origem, destinoDir, nome, logger) {
+  try {
+    await sftp.rename(origem, `/${destinoDir}/${nome}`);
+    return true;
+  } catch {
+    const alt = nome.replace(/(\.[^.]*)?$/, `-${Date.now()}$1`);
+    try {
+      await sftp.rename(origem, `/${destinoDir}/${alt}`);
+      logger.info({ nome, renomeado_para: alt }, 'PVN: nome já existia no destino, movido com sufixo');
+      return true;
+    } catch (err) {
+      logger.warn({ nome, destino: destinoDir, err: err.message }, 'PVN: falha ao mover');
+      return false;
+    }
+  }
 }
 
 // ─── FLUXO ───────────────────────────────────────────────────────────────────
@@ -126,13 +152,19 @@ async function processarPastaPvn(supabase, logger) {
     await sftp.connect(cfg);
 
     const todos = await sftp.list(`/${DIR_UPLOAD}`);
-    const candidatos = todos.filter(f =>
-      f.type === '-' &&
-      /\.xml$/i.test(f.name) &&
-      (agora - f.modifyTime) >= IDADE_MIN_MS
-    );
+    const xmls = todos.filter(f => f.type === '-' && /\.xml$/i.test(f.name));
+    const elegiveis = xmls
+      .filter(f => (agora - f.modifyTime) >= IDADE_MIN_MS)
+      .sort((a, b) => a.modifyTime - b.modifyTime); // mais antigos primeiro: ninguém fica para trás
+    const candidatos = elegiveis.slice(0, MAX_ARQUIVOS);
 
-    logger.info({ na_pasta: todos.length, elegiveis: candidatos.length }, 'PVN: pasta lida');
+    // Relógio do VPS adiantado faria idade negativa e nada seria elegível, em
+    // silêncio. Melhor gritar do que estagnar sem explicação.
+    const futuros = xmls.filter(f => f.modifyTime > agora).length;
+    if (futuros) logger.warn({ arquivos: futuros }, 'PVN: arquivos com data no futuro — relógio do VPS fora de sincronia?');
+
+    logger.info({ na_pasta: todos.length, xml: xmls.length, elegiveis: elegiveis.length, nesta_rodada: candidatos.length }, 'PVN: pasta lida');
+    if (elegiveis.length > MAX_ARQUIVOS) logger.info({ restam: elegiveis.length - MAX_ARQUIVOS }, 'PVN: teto por execução atingido, resto fica para o próximo run');
     if (!candidatos.length) return 0;
 
     // 1ª passada: baixa, valida, extrai chaves.
@@ -147,7 +179,7 @@ async function processarPastaPvn(supabase, logger) {
       if (!ehCte(xml) || !xmlCompleto(xml)) {
         // Provável upload ainda em curso. Só desiste depois do TTL.
         if (idade > TTL_INVALIDO_MS) {
-          await sftp.rename(caminho, `/${DIR_ERRO}/${f.name}`).catch(() => {});
+          await moverArquivo(sftp, caminho, DIR_ERRO, f.name, logger);
           logger.warn({ arquivo: f.name }, 'PVN: XML inválido/truncado além do prazo → erro/');
         }
         continue;
@@ -155,7 +187,7 @@ async function processarPastaPvn(supabase, logger) {
 
       const chaves = extrairChavesNfe(xml);
       if (!chaves.length) {
-        await sftp.rename(caminho, `/${DIR_ERRO}/${f.name}`).catch(() => {});
+        await moverArquivo(sftp, caminho, DIR_ERRO, f.name, logger);
         logger.warn({ arquivo: f.name }, 'PVN: CT-e sem chave de NF-e → erro/');
         continue;
       }
@@ -175,7 +207,7 @@ async function processarPastaPvn(supabase, logger) {
       if (!destinos.length) {
         // CT-e pode ter chegado antes da NF-e entrar no monitoramento.
         if (a.idade > TTL_SEM_LINHA_MS) {
-          await sftp.rename(a.caminho, `/${DIR_ERRO}/${a.nome}`).catch(() => {});
+          await moverArquivo(sftp, a.caminho, DIR_ERRO, a.nome, logger);
           logger.warn({ arquivo: a.nome, chaves: a.chaves.length }, 'PVN: sem linha correspondente além do prazo → erro/');
         }
         continue;
@@ -187,10 +219,7 @@ async function processarPastaPvn(supabase, logger) {
     if (itens.length) gravados = await gravarXmlEmLote(supabase, itens, logger);
 
     // Só sai da upload/ o que realmente casou — o resto reprocessa no próximo run.
-    for (const a of casados) {
-      await sftp.rename(a.caminho, `/${DIR_PROCESSADO}/${a.nome}`)
-        .catch(err => logger.warn({ arquivo: a.nome, err: err.message }, 'PVN: falha ao mover para processado/'));
-    }
+    for (const a of casados) await moverArquivo(sftp, a.caminho, DIR_PROCESSADO, a.nome, logger);
 
     logger.info({ arquivos: casados.length, linhas_gravadas: gravados }, 'PVN: finalizada');
     return gravados;
