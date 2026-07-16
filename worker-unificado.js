@@ -43,8 +43,9 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY
   global: { fetch: (url, options = {}) => fetch(url, { ...options, signal: AbortSignal.timeout(90_000) }) },
 });
 
-const MSSQL_PORTA   = parseInt(process.env.MSSQL_PORT || '1433', 10);
-const MSSQL_TIMEOUT = parseInt(process.env.MSSQL_TIMEOUT || '30000', 10);
+const MSSQL_PORTA      = parseInt(process.env.MSSQL_PORT || '1433', 10);
+const MSSQL_TIMEOUT    = parseInt(process.env.MSSQL_TIMEOUT || '30000', 10);
+const MSSQL_TENTATIVAS = parseInt(process.env.MSSQL_TENTATIVAS || '3', 10);
 
 const mssqlPool = new sql.ConnectionPool({
   user: process.env.MSSQL_USER, password: process.env.MSSQL_PASS,
@@ -84,11 +85,32 @@ async function ipDeSaida() {
   catch { return 'desconhecido'; }
 }
 
+// A rota até o Protheus é intermitente: o TCP abre em ~1s mas o handshake TDS
+// às vezes não completa. Uma tentativa só reprova ~25% dos runs sem motivo.
+async function conectarMssqlComRetry(tentativas) {
+  for (let i = 1; i <= tentativas; i++) {
+    const t0 = Date.now();
+    try {
+      await mssqlPool.connect();
+      logger.info({ host: process.env.MSSQL_HOST, porta: MSSQL_PORTA, tentativa: i, ms: Date.now() - t0 }, 'MSSQL conectado');
+      return;
+    } catch (err) {
+      if (i === tentativas) throw err;
+      const espera = 3000 * i;
+      logger.warn({ tentativa: i, de: tentativas, err: err.message, ms: Date.now() - t0, proxima_em_ms: espera }, 'MSSQL: falhou, retentando');
+      await sleep(espera);
+    }
+  }
+}
+
 async function diagnosticarMssql(host) {
   const [ip, sonda] = await Promise.all([ipDeSaida(), sondarTcp(host, MSSQL_PORTA, MSSQL_TIMEOUT)]);
   const base = { ip_saida: ip, host, porta: MSSQL_PORTA, sonda_ms: sonda.ms };
   if (sonda.ok) {
-    logger.error(base, 'Diagnóstico: porta ABRIU na sondagem — rota ok, falha é de login/driver, não de firewall');
+    // Cuidado ao ler: TCP aberto não inocenta o firewall. Um filtro que faz
+    // SYN-proxy aceita o handshake e descarta o resto; buraco de MTU no caminho
+    // também. O fato objetivo é só este: TCP abre, TDS não completa.
+    logger.error(base, 'Diagnóstico: TCP ABRIU mas o handshake TDS não completou — servidor de pé, algo no caminho ou no SQL Server corta a sessão');
   } else {
     logger.error({ ...base, motivo: sonda.motivo },
       'Diagnóstico: porta INALCANÇÁVEL deste runner — liberar o ip_saida acima no firewall do Protheus');
@@ -825,11 +847,13 @@ async function main() {
     { nome: 'SF2030 (VILLE)',    tenant: process.env.ESL_TENANT, token: process.env.ESL_TOKEN_VILLE,    sufixo: '030', empresa_id: 'VILLE'    },
   ];
 
-  try { await mssqlPool.connect(); logger.info({ host: process.env.MSSQL_HOST, porta: MSSQL_PORTA }, 'MSSQL conectado'); }
+  // Protheus fora NÃO aborta mais o processo: a etapa PVN não depende dele e
+  // deve rodar assim mesmo. Brudam/ESL/QEDB é que ficam de fora.
+  let mssqlOk = false;
+  try { await conectarMssqlComRetry(MSSQL_TENTATIVAS); mssqlOk = true; }
   catch (err) {
-    logger.error({ err: err.message, code: err.code, timeout_ms: MSSQL_TIMEOUT }, 'Falha MSSQL');
+    logger.error({ err: err.message, code: err.code, timeout_ms: MSSQL_TIMEOUT, tentativas: MSSQL_TENTATIVAS }, 'Falha MSSQL — todas as tentativas');
     await diagnosticarMssql(process.env.MSSQL_HOST);
-    process.exit(1);
   }
 
   const { data: execData, error: execErr } = await supabase.from('sync_execucoes').insert([{ empresa_id: 'MULTI', status_execucao: 'PROCESSANDO' }]).select().single();
@@ -853,29 +877,35 @@ async function main() {
   for (const sig of ['SIGTERM','SIGINT']) process.once(sig, () => finalizar('ABORTADO').finally(() => process.exit(0)));
 
   try {
-    logger.info({ total: transportadoras.length }, '── Brudam ──');
-    for (const t of transportadoras) {
-      try { const s = await processarTransportadoraBrudam(t, execucao_id); stats.total_notas_lidas += s.notas_lidas; stats.total_notas_consultadas += s.consultadas; stats.total_novas += s.novas; stats.total_erros += s.erros; }
-      catch (err) { falhasEtapa++; logger.error({ transportadora: t.name, err: err.message }, 'Brudam: erro'); }
-    }
-
-    const dataCorte = new Date(); dataCorte.setDate(dataCorte.getDate() - ESL_JANELA_DIAS);
-    const since = dataCorte.toISOString().split('.')[0] + '-03:00';
-    logger.info({ total: EMPRESAS_ESL.length, since }, '── ESL ──');
-    for (const emp of EMPRESAS_ESL) {
-      try { stats.total_novas += await processarEmpresaEsl(emp.nome, emp, since, execucao_id); }
-      catch (err) { falhasEtapa++; logger.error({ empresa: emp.nome, err: err.message }, 'ESL: erro'); }
-    }
-
-    logger.info('── QEDB ──');
-    try { const n = await processarFluxoQedb(execucao_id); stats.total_novas += n; logger.info({ inseridos: n }, 'QEDB ok'); }
-    catch (err) { falhasEtapa++; logger.error({ err: err.message }, 'QEDB: erro'); }
-
-    // PVN/ESL — Fase 2 do xml_completo. Não usa Protheus: as linhas já existem
-    // (inseridas pelo fluxo ESL) e a resolução empresa_id/filial sai do Supabase.
+    // PVN/ESL — Fase 2 do xml_completo. Roda ANTES e fora do Protheus: as linhas
+    // já existem (fluxo ESL) e empresa_id/filial saem do Supabase. Não deve
+    // morrer junto quando o MSSQL cai.
     logger.info('── PVN (CT-e via SFTP) ──');
     try { const n = await processarPastaPvn(supabase, logger); logger.info({ gravados: n }, 'PVN ok'); }
     catch (err) { falhasEtapa++; logger.error({ err: err.message }, 'PVN: erro'); }
+
+    if (!mssqlOk) {
+      falhasEtapa++;
+      logger.error('Protheus inacessível — Brudam, ESL e QEDB pulados nesta execução');
+    } else {
+      logger.info({ total: transportadoras.length }, '── Brudam ──');
+      for (const t of transportadoras) {
+        try { const s = await processarTransportadoraBrudam(t, execucao_id); stats.total_notas_lidas += s.notas_lidas; stats.total_notas_consultadas += s.consultadas; stats.total_novas += s.novas; stats.total_erros += s.erros; }
+        catch (err) { falhasEtapa++; logger.error({ transportadora: t.name, err: err.message }, 'Brudam: erro'); }
+      }
+
+      const dataCorte = new Date(); dataCorte.setDate(dataCorte.getDate() - ESL_JANELA_DIAS);
+      const since = dataCorte.toISOString().split('.')[0] + '-03:00';
+      logger.info({ total: EMPRESAS_ESL.length, since }, '── ESL ──');
+      for (const emp of EMPRESAS_ESL) {
+        try { stats.total_novas += await processarEmpresaEsl(emp.nome, emp, since, execucao_id); }
+        catch (err) { falhasEtapa++; logger.error({ empresa: emp.nome, err: err.message }, 'ESL: erro'); }
+      }
+
+      logger.info('── QEDB ──');
+      try { const n = await processarFluxoQedb(execucao_id); stats.total_novas += n; logger.info({ inseridos: n }, 'QEDB ok'); }
+      catch (err) { falhasEtapa++; logger.error({ err: err.message }, 'QEDB: erro'); }
+    }
 
     // Fail-loud: run fica vermelho (exit 1) se alguma etapa quebrou ou os erros
     // passaram do limiar — assim o alerta (e-mail/notificação) realmente dispara.
