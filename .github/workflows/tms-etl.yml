@@ -37,4 +37,9 @@ jobs:
           DOTENV_EOF
 
       - name: Rodar ETL
+        env:
+          # dotenv não sobrescreve o que já está no ambiente, então estes vencem.
+          PVN_SFTP_HOST: 31.97.23.238
+          PVN_SFTP_USER: pvn
+          PVN_SFTP_KEY: ${{ secrets.PVN_SFTP_KEY }}
         run: npm start

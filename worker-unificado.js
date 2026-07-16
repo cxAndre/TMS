@@ -8,6 +8,7 @@ require('dotenv').config({ path: path.join(__dirname, '.env') });
 const { buscarOcorrenciasQedb } = require('./qedb');
 const { gravarXmlEmLote } = require('./xml-completo');
 const { criarClienteCteBrudam } = require('./cte-brudam');
+const { processarPastaPvn } = require('./cte-pvn-sftp');
 
 const VARS_OBRIGATORIAS = [
   'SUPABASE_URL', 'SUPABASE_KEY',
@@ -869,6 +870,12 @@ async function main() {
     logger.info('── QEDB ──');
     try { const n = await processarFluxoQedb(execucao_id); stats.total_novas += n; logger.info({ inseridos: n }, 'QEDB ok'); }
     catch (err) { falhasEtapa++; logger.error({ err: err.message }, 'QEDB: erro'); }
+
+    // PVN/ESL — Fase 2 do xml_completo. Não usa Protheus: as linhas já existem
+    // (inseridas pelo fluxo ESL) e a resolução empresa_id/filial sai do Supabase.
+    logger.info('── PVN (CT-e via SFTP) ──');
+    try { const n = await processarPastaPvn(supabase, logger); logger.info({ gravados: n }, 'PVN ok'); }
+    catch (err) { falhasEtapa++; logger.error({ err: err.message }, 'PVN: erro'); }
 
     // Fail-loud: run fica vermelho (exit 1) se alguma etapa quebrou ou os erros
     // passaram do limiar — assim o alerta (e-mail/notificação) realmente dispara.

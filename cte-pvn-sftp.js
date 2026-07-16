@@ -1,0 +1,168 @@
+// etl/cte-pvn-sftp.js
+// Coleta o XML fiscal do CT-e que a PVN deposita por SFTP no VPS.
+//
+// Fluxo INVERTIDO em relação ao Brudam: lá partimos da chave da NF-e e
+// perguntamos à API (pull); aqui o arquivo chega sem contexto (push), então
+// extraímos as chaves de dentro do próprio XML e descobrimos a linha depois.
+//
+// Pastas na jaula do usuário pvn (chroot /home/pvn):
+//   upload/     → PVN escreve
+//   processado/ → gravado no banco com sucesso
+//   erro/       → desistimos (ver TTLs abaixo)
+'use strict';
+
+const SftpClient = require('ssh2-sftp-client');
+const { gravarXmlEmLote } = require('./xml-completo');
+
+const DIR_UPLOAD     = 'upload';
+const DIR_PROCESSADO = 'processado';
+const DIR_ERRO       = 'erro';
+
+// Idade mínima antes de tocar no arquivo: filtro barato contra upload em curso.
+const IDADE_MIN_MS = parseInt(process.env.PVN_IDADE_MIN_MS || String(5 * 60 * 1000), 10);
+// XML truncado/ilegível por mais que isto → erro/ (não vai se consertar sozinho).
+const TTL_INVALIDO_MS = parseInt(process.env.PVN_TTL_INVALIDO_MS || String(60 * 60 * 1000), 10);
+// CT-e válido cuja NF-e ainda não entrou no monitoramento → segura e tenta de novo.
+// Passado o prazo, desiste. O CT-e pode legitimamente chegar antes da NF-e.
+const TTL_SEM_LINHA_MS = parseInt(process.env.PVN_TTL_SEM_LINHA_MS || String(24 * 60 * 60 * 1000), 10);
+
+// ─── VALIDAÇÃO / EXTRAÇÃO ────────────────────────────────────────────────────
+// Um XML cortado no meio do upload não tem a tag de fechamento. É verificação
+// mais confiável que adivinhar por tempo, e não exige nada da PVN.
+function xmlCompleto(xml) {
+  return /<\/cteProc>\s*$/.test(xml.trim()) || /<\/CTe>\s*$/.test(xml.trim());
+}
+
+function ehCte(xml) {
+  return xml.includes('<CTe') || xml.includes('cteProc');
+}
+
+// As chaves de NF-e que o CT-e transporta. Um CT-e consolida várias.
+// Mesma tag usada em cte-brudam.js.
+function extrairChavesNfe(xml) {
+  const achadas = xml.match(/<chave>(\d{44})<\/chave>/g) || [];
+  return [...new Set(achadas.map(t => t.replace(/\D/g, '')))];
+}
+
+// ─── LOOKUP ──────────────────────────────────────────────────────────────────
+// gravarXmlEmLote exige empresa_id + filial + chave_nfe, mas do arquivo só sai
+// a chave. A mesma NF-e pode existir em mais de uma empresa/filial, então
+// devolvemos todas as linhas que casarem.
+async function resolverLinhas(supabase, chaves, lote = 100) {
+  const linhas = [];
+  for (let i = 0; i < chaves.length; i += lote) {
+    const { data, error } = await supabase
+      .from('tms_monitoramento_entregas')
+      .select('empresa_id, filial, chave_nfe')
+      .in('chave_nfe', chaves.slice(i, i + lote));
+    if (error) throw new Error(`Lookup PVN: ${error.message}`);
+    if (data) linhas.push(...data);
+  }
+  const mapa = new Map(); // chave_nfe -> [{empresa_id, filial}]
+  for (const l of linhas) {
+    if (!mapa.has(l.chave_nfe)) mapa.set(l.chave_nfe, []);
+    mapa.get(l.chave_nfe).push({ empresa_id: l.empresa_id, filial: l.filial });
+  }
+  return mapa;
+}
+
+// ─── FLUXO ───────────────────────────────────────────────────────────────────
+function configPvn() {
+  const host = process.env.PVN_SFTP_HOST;
+  const key  = process.env.PVN_SFTP_KEY;
+  if (!host || !key) return null; // etapa opcional: sem config, não roda
+  return {
+    host,
+    port: parseInt(process.env.PVN_SFTP_PORT || '22', 10),
+    username: process.env.PVN_SFTP_USER || 'pvn',
+    privateKey: key,
+    readyTimeout: parseInt(process.env.PVN_SFTP_TIMEOUT || '20000', 10),
+  };
+}
+
+async function processarPastaPvn(supabase, logger) {
+  const cfg = configPvn();
+  if (!cfg) { logger.info('PVN: sem PVN_SFTP_HOST/PVN_SFTP_KEY — etapa pulada'); return 0; }
+
+  const sftp = new SftpClient();
+  const agora = Date.now();
+  let gravados = 0;
+
+  try {
+    await sftp.connect(cfg);
+
+    const todos = await sftp.list(`/${DIR_UPLOAD}`);
+    const candidatos = todos.filter(f =>
+      f.type === '-' &&
+      /\.xml$/i.test(f.name) &&
+      (agora - f.modifyTime) >= IDADE_MIN_MS
+    );
+
+    logger.info({ na_pasta: todos.length, elegiveis: candidatos.length }, 'PVN: pasta lida');
+    if (!candidatos.length) return 0;
+
+    // 1ª passada: baixa, valida, extrai chaves.
+    const arquivos = [];
+    for (const f of candidatos) {
+      const caminho = `/${DIR_UPLOAD}/${f.name}`;
+      let xml;
+      try { xml = (await sftp.get(caminho)).toString('utf8'); }
+      catch (err) { logger.warn({ arquivo: f.name, err: err.message }, 'PVN: falha ao baixar'); continue; }
+
+      const idade = agora - f.modifyTime;
+      if (!ehCte(xml) || !xmlCompleto(xml)) {
+        // Provável upload ainda em curso. Só desiste depois do TTL.
+        if (idade > TTL_INVALIDO_MS) {
+          await sftp.rename(caminho, `/${DIR_ERRO}/${f.name}`).catch(() => {});
+          logger.warn({ arquivo: f.name }, 'PVN: XML inválido/truncado além do prazo → erro/');
+        }
+        continue;
+      }
+
+      const chaves = extrairChavesNfe(xml);
+      if (!chaves.length) {
+        await sftp.rename(caminho, `/${DIR_ERRO}/${f.name}`).catch(() => {});
+        logger.warn({ arquivo: f.name }, 'PVN: CT-e sem chave de NF-e → erro/');
+        continue;
+      }
+      arquivos.push({ nome: f.name, caminho, xml, chaves, idade });
+    }
+    if (!arquivos.length) return 0;
+
+    // 2ª passada: um único lookup para todas as chaves de todos os arquivos.
+    const todasChaves = [...new Set(arquivos.flatMap(a => a.chaves))];
+    const mapa = await resolverLinhas(supabase, todasChaves);
+
+    // 3ª passada: monta os itens e grava.
+    const itens = [];
+    const casados = [];
+    for (const a of arquivos) {
+      const destinos = a.chaves.flatMap(c => (mapa.get(c) || []).map(d => ({ ...d, chave_nfe: c })));
+      if (!destinos.length) {
+        // CT-e pode ter chegado antes da NF-e entrar no monitoramento.
+        if (a.idade > TTL_SEM_LINHA_MS) {
+          await sftp.rename(a.caminho, `/${DIR_ERRO}/${a.nome}`).catch(() => {});
+          logger.warn({ arquivo: a.nome, chaves: a.chaves.length }, 'PVN: sem linha correspondente além do prazo → erro/');
+        }
+        continue;
+      }
+      for (const d of destinos) itens.push({ ...d, xml: a.xml });
+      casados.push(a);
+    }
+
+    if (itens.length) gravados = await gravarXmlEmLote(supabase, itens, logger);
+
+    // Só sai da upload/ o que realmente casou — o resto reprocessa no próximo run.
+    for (const a of casados) {
+      await sftp.rename(a.caminho, `/${DIR_PROCESSADO}/${a.nome}`)
+        .catch(err => logger.warn({ arquivo: a.nome, err: err.message }, 'PVN: falha ao mover para processado/'));
+    }
+
+    logger.info({ arquivos: casados.length, linhas_gravadas: gravados }, 'PVN: finalizada');
+    return gravados;
+  } finally {
+    await sftp.end().catch(() => {});
+  }
+}
+
+module.exports = { processarPastaPvn, extrairChavesNfe, xmlCompleto, ehCte, resolverLinhas };
