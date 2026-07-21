@@ -120,6 +120,24 @@ async function diagnosticarMssql(host) {
 // ─── UTILITÁRIOS ──────────────────────────────────────────────────────────────
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
+// O SQL Server elege uma transação como "vítima" (erro 1205) quando duas
+// disputam o mesmo lock — comum com o Protheus em uso simultâneo. A própria
+// mensagem manda repetir ("Rerun the transaction"), então repetimos com espera
+// crescente em vez de deixar o deadlock derrubar o run inteiro.
+async function queryMssqlComRetry(sqlText, tentativas = 3) {
+  for (let i = 1; i <= tentativas; i++) {
+    try {
+      return await mssqlPool.request().query(sqlText);
+    } catch (err) {
+      const ehDeadlock = err.number === 1205 || /deadlock/i.test(err.message || '');
+      if (!ehDeadlock || i === tentativas) throw err;
+      const espera = 2000 * i;
+      logger.warn({ tentativa: i, de: tentativas, proxima_em_ms: espera }, 'MSSQL: deadlock (1205), repetindo a query');
+      await sleep(espera);
+    }
+  }
+}
+
 function normalizarDataBrasil(data) {
   if (!data) return null;
   try {
@@ -266,7 +284,7 @@ async function buscarChavesProtheus_EslMultiEmpresa(chaves) {
   if (!filtradas.length) return [];
   const inList = filtradas.map(c => `'${c}'`).join(',');
   const blocks = EMPRESAS_PROTHEUS.map(({ sufixo, empresa_id }) => buildQueryEsl(sufixo, empresa_id, inList));
-  return (await mssqlPool.request().query(blocks.join('\nUNION ALL\n'))).recordset;
+  return (await queryMssqlComRetry(blocks.join('\nUNION ALL\n'))).recordset;
 }
 
 async function buscarChavesProtheus_Brudam(cnpjs, nome) {
@@ -276,7 +294,7 @@ async function buscarChavesProtheus_Brudam(cnpjs, nome) {
   const inList = limpos.map(c => `'${c}'`).join(',');
   const blocks = EMPRESAS_PROTHEUS.map(({ sufixo, empresa_id }) => buildQueryBrudam(sufixo, empresa_id, inList, JANELA_DIAS_PROTHEUS));
   logger.info({ transportadora: nome, cnpjs: limpos.length }, 'Brudam: consultando Protheus');
-  const result = await mssqlPool.request().query(blocks.join('\nUNION ALL\n'));
+  const result = await queryMssqlComRetry(blocks.join('\nUNION ALL\n'));
   logger.info({ transportadora: nome, total: result.recordset.length }, 'Brudam: NF-es encontradas');
   return result.recordset;
 }
@@ -752,7 +770,7 @@ async function processarFluxoQedb(execucao_id) {
   for (const [empresaId, dados] of nfsPorEmpresa.entries()) {
     const listNf    = [...new Set(dados.ocs.map(o => `'${o.numeroNF}'`))].join(',');
     const listSerie = [...new Set(dados.ocs.map(o => { const s = String(o.serieNF).replace(/^0+/,''); return `'${s || '0'}'`; }))].join(',');
-    const result    = await mssqlPool.request().query(buildQueryQedb(dados.config.sufixo, empresaId, listNf, listSerie));
+    const result    = await queryMssqlComRetry(buildQueryQedb(dados.config.sufixo, empresaId, listNf, listSerie));
     const protheus  = result.recordset;
     logger.info({ empresa: empresaId, totalApi: dados.ocs.length, totalProtheus: protheus.length }, 'QEDB: cruzamento');
 
