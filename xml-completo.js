@@ -56,14 +56,24 @@ function jsonParaXml(valor, nomeRaiz = 'root') {
   return '<?xml version="1.0" encoding="UTF-8"?>\n' + renderNode(nomeRaiz, valor, 0);
 }
 
+// CNPJ raiz (8 primeiros dígitos) da PVN, presente no <emit><CNPJ> do XML dela.
+// Serve de marca de origem SEM coluna extra: quando o xml_completo já contém
+// este CNPJ, foi a PVN que gravou — e a PVN faz a entrega ao cliente final,
+// então prevalece. Outras fontes (Brudam) não devem sobrescrever.
+const PVN_CNPJ_RAIZ = '12270745';
+
 // ─── GRAVAÇÃO EM LOTE DA COLUNA xml_completo ────────────────────────────────
 /**
  * Atualiza a coluna xml_completo para uma lista de chaves já existentes.
  * Cada item: { empresa_id, filial, chave_nfe, xml }.
  * Falhas individuais são logadas mas não interrompem o fluxo.
+ * @param {object} [opts]
+ * @param {boolean} [opts.protegerPvn] Quando true (fontes que NÃO são a PVN),
+ *        só grava se o xml_completo atual for NULL ou não for um CT-e da PVN.
+ *        Impede que o Brudam sobrescreva o CT-e da PVN nos runs seguintes.
  * @returns {number} quantidade de linhas atualizadas com sucesso
  */
-async function gravarXmlEmLote(supabase, itens, logger, concorrencia = 10) {
+async function gravarXmlEmLote(supabase, itens, logger, concorrencia = 10, opts = {}) {
   if (!itens?.length) return 0;
   const validos = itens.filter(i => i && i.empresa_id && i.filial && i.chave_nfe && i.xml);
   let ok = 0;
@@ -71,12 +81,19 @@ async function gravarXmlEmLote(supabase, itens, logger, concorrencia = 10) {
   for (let i = 0; i < validos.length; i += concorrencia) {
     const bloco = validos.slice(i, i + concorrencia);
     const resultados = await Promise.allSettled(bloco.map(async it => {
-      const { error } = await supabase
+      let q = supabase
         .from('tms_monitoramento_entregas')
         .update({ xml_completo: it.xml })
         .eq('empresa_id', it.empresa_id)
         .eq('filial', it.filial)
         .eq('chave_nfe', it.chave_nfe);
+      // Trava: não sobrescreve um CT-e já gravado pela PVN. Casa quando o
+      // valor atual é NULL ou não contém o CNPJ raiz da PVN. (No PostgREST o
+      // curinga do ilike dentro de .or() é o asterisco.)
+      if (opts.protegerPvn) {
+        q = q.or(`xml_completo.is.null,xml_completo.not.ilike.*${PVN_CNPJ_RAIZ}*`);
+      }
+      const { error } = await q;
       if (error) throw error;
     }));
     for (const r of resultados) {
@@ -87,4 +104,4 @@ async function gravarXmlEmLote(supabase, itens, logger, concorrencia = 10) {
   return ok;
 }
 
-module.exports = { jsonParaXml, gravarXmlEmLote, escaparXml, nomeTagValido };
+module.exports = { jsonParaXml, gravarXmlEmLote, escaparXml, nomeTagValido, PVN_CNPJ_RAIZ };

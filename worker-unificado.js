@@ -604,7 +604,9 @@ async function processarTransportadoraBrudam(t, execucao_id) {
             const cte = mapaCte.get(String(row.f2_chvnfe).trim());
             if (cte?.xml) cteUpdates.push({ empresa_id: row.empresa_id, filial: row.filial, chave_nfe: String(row.f2_chvnfe).trim(), xml: cte.xml });
           }
-          const grav = await gravarXmlEmLote(supabase, cteUpdates, logger);
+          // protegerPvn: Brudam não sobrescreve um CT-e já gravado pela PVN
+          // (a PVN faz a entrega final e deve prevalecer).
+          const grav = await gravarXmlEmLote(supabase, cteUpdates, logger, 10, { protegerPvn: true });
           logger.debug({ transportadora: t.name, cte_gravados: grav }, 'CT-e XML atualizado');
         } catch (errCte) {
           logger.warn({ transportadora: t.name, err: errCte.message }, 'CT-e: falha ao buscar/gravar XML do lote (segue)');
