@@ -895,13 +895,6 @@ async function main() {
   for (const sig of ['SIGTERM','SIGINT']) process.once(sig, () => finalizar('ABORTADO').finally(() => process.exit(0)));
 
   try {
-    // PVN/ESL — Fase 2 do xml_completo. Roda ANTES e fora do Protheus: as linhas
-    // já existem (fluxo ESL) e empresa_id/filial saem do Supabase. Não deve
-    // morrer junto quando o MSSQL cai.
-    logger.info('── PVN (CT-e via SFTP) ──');
-    try { const n = await processarPastaPvn(supabase, logger); logger.info({ gravados: n }, 'PVN ok'); }
-    catch (err) { falhasEtapa++; logger.error({ err: err.message }, 'PVN: erro'); }
-
     if (!mssqlOk) {
       falhasEtapa++;
       logger.error('Protheus inacessível — Brudam, ESL e QEDB pulados nesta execução');
@@ -924,6 +917,16 @@ async function main() {
       try { const n = await processarFluxoQedb(execucao_id); stats.total_novas += n; logger.info({ inseridos: n }, 'QEDB ok'); }
       catch (err) { falhasEtapa++; logger.error({ err: err.message }, 'QEDB: erro'); }
     }
+
+    // PVN — Fase 2 do xml_completo, roda por ÚLTIMO de propósito. A PVN faz a
+    // entrega ao cliente final, então o CT-e dela deve prevalecer: quando uma
+    // NF-e tem CT-e da PVN E de outra transportadora (redespacho), a gravação
+    // da PVN sobrescreve a anterior. Fica FORA do guard do MSSQL — não usa
+    // Protheus (empresa_id/filial saem do Supabase), então roda mesmo com o
+    // Protheus fora.
+    logger.info('── PVN (CT-e via SFTP) ──');
+    try { const n = await processarPastaPvn(supabase, logger); logger.info({ gravados: n }, 'PVN ok'); }
+    catch (err) { falhasEtapa++; logger.error({ err: err.message }, 'PVN: erro'); }
 
     // Fail-loud: run fica vermelho (exit 1) se alguma etapa quebrou ou os erros
     // passaram do limiar — assim o alerta (e-mail/notificação) realmente dispara.
