@@ -14,7 +14,11 @@
 const SftpClient = require('ssh2-sftp-client');
 const { gravarXmlEmLote } = require('./xml-completo');
 
-const DIR_UPLOAD     = 'upload';
+// Pasta lida pelo worker. A PVN exporta para /upload e, com a opção "Mover
+// arquivos" no painel ESL Cloud, o sistema deles move o XML para a subpasta
+// ESL dentro de /upload — é ali que os arquivos ficam. Configurável por env
+// caso a PVN mude o destino.
+const DIR_UPLOAD     = process.env.PVN_SFTP_DIR || 'upload/ESL';
 const DIR_PROCESSADO = 'processado';
 const DIR_ERRO       = 'erro';
 
@@ -150,6 +154,13 @@ async function processarPastaPvn(supabase, logger) {
 
   try {
     await sftp.connect(cfg);
+
+    // A subpasta ESL só nasce quando a PVN faz o primeiro envio com "Mover".
+    // Antes disso, listar dá erro — tratamos como pasta vazia, sem quebrar.
+    if (!(await sftp.exists(`/${DIR_UPLOAD}`))) {
+      logger.info({ dir: DIR_UPLOAD }, 'PVN: pasta ainda não existe (sem envios) — etapa sem trabalho');
+      return 0;
+    }
 
     const todos = await sftp.list(`/${DIR_UPLOAD}`);
     const xmls = todos.filter(f => f.type === '-' && /\.xml$/i.test(f.name));
