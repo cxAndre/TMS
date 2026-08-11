@@ -514,6 +514,10 @@ async function salvarCtes(registros, papel = 'ENTREGA') {
     ingest_source: r.ingest_source, cnpj_transportador: r.cnpj_transportador,
     ultima_ocorrencia_codigo: r.ultima_ocorrencia_codigo,
     ultima_ocorrencia_data: r.ultima_ocorrencia_data,
+    // Guarda TODAS as datas por perna — a view monta a timeline ACERTA a partir
+    // delas (coleta ES + chegada CD da perna CHEGADA; saída + entrega da ENTREGA).
+    dt_coleta: r.dt_coleta, dt_emissao_edi: r.dt_emissao_edi, dt_cte_sefaz: r.dt_cte_sefaz,
+    dt_hub_conferido: r.dt_hub_conferido, dt_saida_efetiva: r.dt_saida_efetiva,
     dt_em_transito: r.dt_em_transito, dt_entregue: r.dt_entregue,
     dt_canhoto: r.dt_canhoto, dt_devolucao: r.dt_devolucao,
     execucao_id: r.execucao_id,
