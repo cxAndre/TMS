@@ -42,4 +42,7 @@ jobs:
           PVN_SFTP_HOST: 31.97.23.238
           PVN_SFTP_USER: pvn
           PVN_SFTP_KEY: ${{ secrets.PVN_SFTP_KEY }}
+          # Runner do GitHub tem rota mais lenta até o Protheus que a máquina local:
+          # a query do ACERTA/ESL estoura o requestTimeout padrão de 60s. Sobe p/ 300s.
+          MSSQL_REQ_TIMEOUT: '300000'
         run: npm start
