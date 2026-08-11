@@ -12,9 +12,11 @@ async function buscarOcorrenciasQedb({ clientId, token, baseUrl }) {
 
   logger.info('QEDB: Iniciando extração incremental via paginação nativa.');
 
-  // Calcula a janela dinâmica de 30 dias (Formato YYYY-MM-DD exigido pelo payload)
+  // Janela dinâmica (Formato YYYY-MM-DD exigido pelo payload). Padrão 30 dias,
+  // ampliável via QEDB_JANELA para backfill histórico.
+  const janelaDias = parseInt(process.env.QEDB_JANELA || '30', 10);
   const dtCorte = new Date();
-  dtCorte.setDate(dtCorte.getDate() - 30);
+  dtCorte.setDate(dtCorte.getDate() - janelaDias);
   const dataI = dtCorte.toISOString().split('T')[0];
   const dataF = new Date().toISOString().split('T')[0]; // Hoje
 

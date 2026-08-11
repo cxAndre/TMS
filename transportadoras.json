@@ -2,6 +2,7 @@
   "transportadoras": [
     {
       "name": "BRUDAM-ACERTA-EXPRESS",
+      "papel": "CHEGADA",
       "base": "https://acertaexpress.brudam.com.br",
       "auth_url": "https://acertaexpress.brudam.com.br/api/v1/acesso/auth/login",
       "cnpjs": [
@@ -22,6 +23,7 @@
     },
     {
       "name": "BRUDAM-DDMLOG",
+      "papel": "ENTREGA",
       "base": "https://ddmlog.brudam.com.br",
       "auth_url": "https://ddmlog.brudam.com.br/api/v1/acesso/auth/login",
       "cnpjs": [

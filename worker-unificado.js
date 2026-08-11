@@ -38,6 +38,9 @@ const ESL_JANELA_DIAS      = parseInt(process.env.ESL_JANELA  || '5',   10);
 const TOKEN_TTL_MS         = 55 * 60 * 1000;
 const SLEEP_ENTRE_LOTES_MS = parseInt(process.env.SLEEP_LOTES || '1000',10);
 const BATCH_SIZE_DB        = parseInt(process.env.BATCH_DB    || '50',  10);
+// Janela QEDB: API (dias) e corte SQL Protheus (dias). Backfill = ampliar via env.
+const QEDB_JANELA          = parseInt(process.env.QEDB_JANELA      || '30', 10);
+const QEDB_JANELA_PROT     = parseInt(process.env.QEDB_JANELA_PROT || String(QEDB_JANELA + 30), 10);
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, {
   global: { fetch: (url, options = {}) => fetch(url, { ...options, signal: AbortSignal.timeout(90_000) }) },
@@ -223,7 +226,7 @@ function buildQueryEsl(sufixo, empresaId, inListChaves) {
 }
 
 function buildQueryQedb(sufixo, empresaId, inListNf, inListSerie) {
-  const dt = new Date(); dt.setDate(dt.getDate() - 60);
+  const dt = new Date(); dt.setDate(dt.getDate() - QEDB_JANELA_PROT);
   const dataCorte = dt.toISOString().split('T')[0].replace(/-/g, '');
   const fmtNfs    = inListNf.split(',').map(nf => `'${nf.trim().replace(/'/g,'').padStart(9,'0')}'`).join(',');
   const fmtSeries = inListSerie.split(',').map(s => `'${s.trim().replace(/'/g,'')}'`).join(',');
@@ -490,6 +493,41 @@ async function salvarRegistros(registros) {
   return validos.length;
 }
 
+// ─── TMS_CTES (tabela filha: 1 linha por CT-e / perna de frete) ──────────────
+// Uma NF-e transferida entre bases (ES→CD SP) tem vários CT-e: ACERTA leva até
+// o CD (papel CHEGADA) e DDM/PVN entrega ao cliente (papel ENTREGA). A tabela
+// principal colapsa em 1 linha por chave_nfe; esta filha preserva cada perna.
+// Só grava CT-e real (cte_numero não-nulo). Falha aqui não derruba o run.
+async function salvarCtes(registros, papel = 'ENTREGA') {
+  if (!registros?.length) return 0;
+  const mapa = new Map();
+  for (const r of registros) {
+    if (!r.empresa_id || !r.filial || !r.chave_nfe || !r.cte_numero) continue;
+    const k = `${r.empresa_id}|${r.filial}|${r.chave_nfe}|${r.cte_numero}`;
+    const prev = mapa.get(k);
+    // dedupe: mantém a perna com ocorrência mais recente
+    if (!prev || String(r.ultima_ocorrencia_data || '') > String(prev.ultima_ocorrencia_data || '')) mapa.set(k, r);
+  }
+  const ctes = [...mapa.values()].map(r => ({
+    empresa_id: r.empresa_id, filial: r.filial, chave_nfe: r.chave_nfe,
+    cte_numero: r.cte_numero, papel,
+    ingest_source: r.ingest_source, cnpj_transportador: r.cnpj_transportador,
+    ultima_ocorrencia_codigo: r.ultima_ocorrencia_codigo,
+    ultima_ocorrencia_data: r.ultima_ocorrencia_data,
+    dt_em_transito: r.dt_em_transito, dt_entregue: r.dt_entregue,
+    dt_canhoto: r.dt_canhoto, dt_devolucao: r.dt_devolucao,
+    execucao_id: r.execucao_id,
+  }));
+  if (!ctes.length) return 0;
+  try {
+    for (let i = 0; i < ctes.length; i += BATCH_SIZE_DB) {
+      const { error } = await supabase.rpc('upsert_lote_ctes', { registros: ctes.slice(i, i + BATCH_SIZE_DB) });
+      if (error) throw error;
+    }
+  } catch (err) { logger.warn({ err: err.message, papel }, 'tms_ctes: falha ao gravar (segue)'); return 0; }
+  return ctes.length;
+}
+
 async function gravarErroNaEntrega(loteRows, mensagemErro) {
   if (!loteRows?.length) return;
   const grupos = new Map();
@@ -595,6 +633,7 @@ async function processarTransportadoraBrudam(t, execucao_id) {
         }
 
         stats.novas += await salvarRegistros(registros);
+        await salvarCtes(registros, t.papel || 'ENTREGA'); // perna: ACERTA=CHEGADA, DDM=ENTREGA (via transportadoras.json)
 
         // xml_completo: XML fiscal do CT-e (Brudam /dfe/cte/nota), por chave da NF-e
         try {
@@ -716,6 +755,7 @@ async function processarEmpresaEsl(origemNome, credencial, sinceFormatted, execu
   }
 
   const inseridos = await salvarRegistros(registros);
+  await salvarCtes(registros, 'ENTREGA'); // ESL/PVN entrega ao cliente final
   // xml_completo (CT-e) para ESL fica na Fase 2 — não gravado aqui.
   logger.info({ empresa: origemNome, inseridos }, 'ESL: finalizada');
   return inseridos;
@@ -845,6 +885,7 @@ async function processarFluxoQedb(execucao_id) {
 
     if (regs.length > 0) {
       await salvarRegistros(regs);
+      await salvarCtes(regs, 'ENTREGA'); // QEDB: perna única de entrega
       total += regs.length;
       // xml_completo (CT-e) para QEDB fica na Fase 2 — não gravado aqui.
     }
