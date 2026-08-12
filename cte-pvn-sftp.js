@@ -14,11 +14,10 @@
 const SftpClient = require('ssh2-sftp-client');
 const { gravarXmlEmLote } = require('./xml-completo');
 
-// Pasta lida pelo worker. A PVN exporta para /upload e, com a opção "Mover
-// arquivos" no painel ESL Cloud, o sistema deles move o XML para a subpasta
-// ESL dentro de /upload — é ali que os arquivos ficam. Configurável por env
-// caso a PVN mude o destino.
-const DIR_UPLOAD     = process.env.PVN_SFTP_DIR || 'upload/ESL';
+// Pasta lida pelo worker. O painel ESL Cloud da PVN combina Raiz (/upload) +
+// Pasta do FTP (upload), então os XMLs caem em /upload/upload. Confirmado em
+// produção 2026-08-12. Configurável por env caso a PVN mude o campo "Pasta".
+const DIR_UPLOAD     = process.env.PVN_SFTP_DIR || 'upload/upload';
 const DIR_PROCESSADO = 'processado';
 const DIR_ERRO       = 'erro';
 
