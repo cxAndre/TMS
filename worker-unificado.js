@@ -401,20 +401,27 @@ function extrairDatasConsolidadas(ocorrencias) {
     .sort((a, b) => a._date - b._date);
 
   for (const oc of ordenadas) {
-    const status = String(oc.status || '').trim();
+    const statusRaw = String(oc.status || '').trim();
+    // Normaliza zero à esquerda: fontes diferentes mandam '1' ou '01', '2' ou
+    // '02', '7' ou '07' para o mesmo evento. Sem isso, '01 ENTREGA REALIZADA'
+    // (que existe aos milhares) não casava com '1' e a entrega era perdida.
+    const status = statusRaw.replace(/^0+(?=\d)/, '');
     const desc   = String(oc.descricao || '').toUpperCase().trim();
     const data   = normalizarDataBrasil(oc.data); // FIX: normalizar aqui
-    const temCod = status !== '';
+    const temCod = statusRaw !== '';
+    const cod = (...arr) => arr.includes(status);
 
-    if (status === '147' || (!temCod && desc.includes('COLETA REALIZADA')))                                                    datas.dt_coleta        = data;
-    if (status === '125' || (!temCod && desc.includes('CTE AUTORIZADO')))                                                      datas.dt_cte_sefaz     = data;
-    if (status === '123' || status === '100' || (!temCod && desc.includes('EMISSAO REALIZADA')))                               datas.dt_emissao_edi   = data;
-    if (status === '111' || (!temCod && desc.includes('HUB DA TRANSPORTADORA')))                                               datas.dt_hub_conferido = data;
-    if (status === '103' || (!temCod && desc.includes('SAIDA EFETIVA')))                                                       datas.dt_saida_efetiva = data;
-    if (status === '165' || status === '99' || status === '215' || (!temCod && (desc.includes('MANIFESTADO') || desc.includes('TRANSFERENCIA') || desc.includes('EM TRANSFERENCIA') || desc.includes('ROTA DE ENTREGA'))))  datas.dt_em_transito   = data;
-    if (status === '1'   || status === '02' || (!temCod && desc.includes('ENTREGA REALIZADA')))                               datas.dt_entregue      = data;
-    if (status === '105' || (!temCod && desc.includes('COMPROVANTE DE ENTREGA')))                                             datas.dt_canhoto       = data;
-    if (status === '199' || status === '07' || status === '25' || (!temCod && (desc.includes('DEVOLVIDA') || desc.includes('DEVOLUCAO'))))  datas.dt_devolucao     = data;
+    if (cod('147') || (!temCod && desc.includes('COLETA REALIZADA')))                          datas.dt_coleta        = data;
+    if (cod('125') || (!temCod && desc.includes('CTE AUTORIZADO')))                            datas.dt_cte_sefaz     = data;
+    if (cod('123','100') || (!temCod && desc.includes('EMISSAO REALIZADA')))                   datas.dt_emissao_edi   = data;
+    if (cod('111') || (!temCod && desc.includes('HUB DA TRANSPORTADORA')))                     datas.dt_hub_conferido = data;
+    if (cod('103') || (!temCod && desc.includes('SAIDA EFETIVA')))                             datas.dt_saida_efetiva = data;
+    // Trânsito: inclui transferência entre bases (101/174), recebida na
+    // transportadora (531), conexão (65) e rota de entrega (28).
+    if (cod('165','99','215','101','174','531','65','28') || (!temCod && (desc.includes('MANIFESTADO') || desc.includes('TRANSFERENCIA') || desc.includes('EM TRANSFERENCIA') || desc.includes('ROTA DE ENTREGA') || desc.includes('CONEXAO'))))  datas.dt_em_transito = data;
+    if (cod('1','2') || (!temCod && desc.includes('ENTREGA REALIZADA')))                       datas.dt_entregue      = data;
+    if (cod('105') || (!temCod && desc.includes('COMPROVANTE DE ENTREGA')))                    datas.dt_canhoto       = data;
+    if (cod('199','7','25') || (!temCod && (desc.includes('DEVOLVIDA') || desc.includes('DEVOLUCAO'))))  datas.dt_devolucao = data;
   }
   return datas;
 }
@@ -605,27 +612,65 @@ async function processarTransportadoraBrudam(t, execucao_id) {
           } else { mapaOc.get(docItem).push(item); }
         }
 
-        const registros = [];
+        const registros   = []; // UMA por NF-e   → tms_monitoramento_entregas
+        const registrosOc = []; // UMA por ocorrência → tms_ctes (preserva as pernas/CT-es)
         for (const row of loteRows) {
           const chave = String(row.f2_chvnfe).trim();
           const ocs   = mapaOc.get(chave) || [];
+          const validas = ocs.filter(o => o.descricao || o.data || o.status);
+          if (!validas.length) continue;
           const datas = extrairDatasConsolidadas(ocs);
 
-          for (const item of ocs) {
-            if (!item.descricao && !item.data && !item.status) continue;
-            const previsao = item.prev_entrega || item.previsao_entrega || item.previsaoEntrega || null;
-            registros.push(montarRegistro({
+          // ── Main table: UMA linha por NF-e, com a ocorrência mais recente.
+          // Antes empurrava uma linha por ocorrência e, como a API vem da mais
+          // nova p/ mais velha, o upsert (último vence) deixava a MAIS VELHA
+          // (coleta) como "última". Agora escolhe a de maior data.
+          const comData = validas
+            .map(o => ({ o, d: o.data ? new Date(normalizarDataBrasil(o.data) || '') : null }))
+            .filter(x => x.d && !isNaN(x.d))
+            .sort((a, b) => b.d - a.d);
+          const ultima = comData[0]?.o || validas[validas.length - 1];
+          const ordNovoPrimeiro = comData.length ? comData.map(x => x.o) : validas;
+          const pick = (...keys) => { for (const it of ordNovoPrimeiro) for (const k of keys) { const v = it?.[k]; if (v != null && v !== '') return v; } return null; };
+
+          registros.push(montarRegistro({
+            empresa_id: row.empresa_id, filial: row.filial, cnpj_transportador: row.cnpj_transportador,
+            chave_nfe: chave,
+            nf_numero: pick('nf_numero','nfNumero','numero_nf','notafiscal'),
+            cte_numero: pick('cte_numero','cteNumero'),
+            razao_destinatario: pick('razao_destinatario','razaoDestinatario','destinatario'),
+            cnpj_destinatario: pick('cnpj_destinatario','cnpjDestinatario'),
+            municipio_destino: null, uf_destino: null, // Brudam não fornece endereço
+            codigo_representante: row.codigo_representante,
+            modal_transporte: pick('servico','modal'),
+            valor_nf: row.valor_nf || null,
+            previsao_entrega: pick('prev_entrega','previsao_entrega','previsaoEntrega'),
+            execucao_id, ingest_source: t.name,
+            ultima_ocorrencia_codigo: String(ultima.status ?? ultima.api_status ?? ultima.codigo ?? '').trim() || null,
+            ultima_ocorrencia_data: ultima.data || ultima.dataOcorrencia || null,
+            ultima_ocorrencia_descricao: ultima.descricao || ultima.ocorrencia || null,
+            entrega_nome: pick('entrega_nome','entregaNome'),
+            entrega_documento: pick('entrega_rg','entregaRg'),
+            ...datas,
+          }));
+
+          // ── tms_ctes: uma linha por ocorrência (o salvarCtes deduplica por
+          // cte_numero mantendo a de maior data). Preserva NF-e com 2+ CT-es
+          // (redespacho / pernas ES→SP). Comportamento inalterado.
+          for (const item of validas) {
+            registrosOc.push(montarRegistro({
               empresa_id: row.empresa_id, filial: row.filial, cnpj_transportador: row.cnpj_transportador,
               chave_nfe: chave,
               nf_numero: item.nf_numero || item.nfNumero || item.numero_nf || item.notafiscal || null,
               cte_numero: item.cte_numero || item.cteNumero || null,
               razao_destinatario: item.razao_destinatario || item.razaoDestinatario || item.destinatario || null,
               cnpj_destinatario: item.cnpj_destinatario || item.cnpjDestinatario || null,
-              municipio_destino: null, uf_destino: null, // Brudam não fornece endereço
+              municipio_destino: null, uf_destino: null,
               codigo_representante: row.codigo_representante,
               modal_transporte: item.servico || item.modal || null,
               valor_nf: row.valor_nf || null,
-              previsao_entrega: previsao, execucao_id, ingest_source: t.name,
+              previsao_entrega: item.prev_entrega || item.previsao_entrega || item.previsaoEntrega || null,
+              execucao_id, ingest_source: t.name,
               ultima_ocorrencia_codigo: String(item.status ?? item.api_status ?? item.codigo ?? '').trim() || null,
               ultima_ocorrencia_data: item.data || item.dataOcorrencia || null,
               ultima_ocorrencia_descricao: item.descricao || item.ocorrencia || null,
@@ -637,7 +682,7 @@ async function processarTransportadoraBrudam(t, execucao_id) {
         }
 
         stats.novas += await salvarRegistros(registros);
-        await salvarCtes(registros, t.papel || 'ENTREGA'); // perna: ACERTA=CHEGADA, DDM=ENTREGA (via transportadoras.json)
+        await salvarCtes(registrosOc, t.papel || 'ENTREGA'); // perna: ACERTA=CHEGADA, DDM=ENTREGA (via transportadoras.json)
 
         // xml_completo: XML fiscal do CT-e (Brudam /dfe/cte/nota), por chave da NF-e
         try {
