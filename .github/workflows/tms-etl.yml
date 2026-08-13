@@ -6,7 +6,12 @@ on:
     # Cron em UTC. Brasil = UTC-3. '0 * * * *' = de hora em hora.
     # Exemplos: '0 */2 * * *' a cada 2h | '0 9-21 * * *' das 6h às 18h BRT.
     - cron: '0 * * * *'
-  workflow_dispatch: {}   # permite rodar na mão pela aba Actions
+  workflow_dispatch:      # permite rodar na mão pela aba Actions
+    inputs:
+      janela_dias:
+        description: 'Backfill: janela do Protheus em dias (vazio = padrão). Ex.: 230 = desde o começo do ano.'
+        required: false
+        default: ''
 
 # Evita duas execuções simultâneas (o worker já barra, isto é reforço).
 concurrency:
@@ -45,4 +50,7 @@ jobs:
           # Runner do GitHub tem rota mais lenta até o Protheus que a máquina local:
           # a query do ACERTA/ESL estoura o requestTimeout padrão de 60s. Sobe p/ 300s.
           MSSQL_REQ_TIMEOUT: '300000'
+          # Backfill sob demanda: só preenchido quando disparado na mão com valor.
+          # Vazio (runs agendados) → worker usa o JANELA_DIAS do secret.
+          JANELA_DIAS_OVERRIDE: ${{ github.event.inputs.janela_dias }}
         run: npm start

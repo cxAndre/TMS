@@ -33,7 +33,10 @@ const logger = pino({
 
 const BRUDAM_BATCH_SIZE    = parseInt(process.env.BATCH_SIZE  || '50',  10);
 const BRUDAM_MAX_GW_ERROS  = parseInt(process.env.MAX_GW_ERRS || '5',   10);
-const JANELA_DIAS_PROTHEUS = parseInt(process.env.JANELA_DIAS || '30',  10);
+// JANELA_DIAS_OVERRIDE permite um backfill pontual (ex.: reprocessar desde o
+// início do ano) sem tocar no secret DOTENV: o workflow injeta esse env só
+// quando disparado na mão com o valor. Vazio → cai no JANELA_DIAS normal.
+const JANELA_DIAS_PROTHEUS = parseInt(process.env.JANELA_DIAS_OVERRIDE || process.env.JANELA_DIAS || '30', 10);
 const ESL_JANELA_DIAS      = parseInt(process.env.ESL_JANELA  || '5',   10);
 const TOKEN_TTL_MS         = 55 * 60 * 1000;
 const SLEEP_ENTRE_LOTES_MS = parseInt(process.env.SLEEP_LOTES || '1000',10);
