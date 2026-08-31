@@ -6,9 +6,9 @@
 const path = require('path');
 require('dotenv').config({ path: path.join(__dirname, '.env') });
 const { buscarOcorrenciasQedb } = require('./qedb');
-const { gravarXmlEmLote } = require('./xml-completo');
+const { gravarXmlEmLote, prioridadeFonte } = require('./xml-completo');
 const { criarClienteCteBrudam } = require('./cte-brudam');
-const { processarPastaPvn } = require('./cte-pvn-sftp');
+const { processarPastaPvn, processarPastaQedb } = require('./cte-pvn-sftp');
 
 const VARS_OBRIGATORIAS = [
   'SUPABASE_URL', 'SUPABASE_KEY',
@@ -695,9 +695,11 @@ async function processarTransportadoraBrudam(t, execucao_id) {
             const cte = mapaCte.get(String(row.f2_chvnfe).trim());
             if (cte?.xml) cteUpdates.push({ empresa_id: row.empresa_id, filial: row.filial, chave_nfe: String(row.f2_chvnfe).trim(), xml: cte.xml });
           }
-          // protegerPvn: Brudam não sobrescreve um CT-e já gravado pela PVN
-          // (a PVN faz a entrega final e deve prevalecer).
-          const grav = await gravarXmlEmLote(supabase, cteUpdates, logger, 10, { protegerPvn: true });
+          // Precedência: a prioridade do Brudam vem do CNPJ da própria
+          // transportadora (ACERTA=40, DDM=80). Assim o ACERTA não sobrescreve
+          // PVN/DDM/QEDB, e o DDM não sobrescreve a PVN.
+          const prioridade = prioridadeFonte(String(t.cnpjs?.[0] || '').slice(0, 8));
+          const grav = await gravarXmlEmLote(supabase, cteUpdates, logger, 10, { prioridade });
           logger.debug({ transportadora: t.name, cte_gravados: grav }, 'CT-e XML atualizado');
         } catch (errCte) {
           logger.warn({ transportadora: t.name, err: errCte.message }, 'CT-e: falha ao buscar/gravar XML do lote (segue)');
@@ -1012,6 +1014,13 @@ async function main() {
       try { const n = await processarFluxoQedb(execucao_id); stats.total_novas += n; logger.info({ inseridos: n }, 'QEDB ok'); }
       catch (err) { falhasEtapa++; logger.error({ err: err.message }, 'QEDB: erro'); }
     }
+
+    // QEDB (Quality) — CT-e via SFTP, mesmo mecanismo da PVN. Prioridade 60:
+    // sobrescreve ACERTA, mas não PVN/DDM (a trava de precedência cuida disso).
+    // Fora do guard do MSSQL — não usa Protheus.
+    logger.info('── QEDB (CT-e via SFTP) ──');
+    try { const n = await processarPastaQedb(supabase, logger); logger.info({ gravados: n }, 'QEDB SFTP ok'); }
+    catch (err) { falhasEtapa++; logger.error({ err: err.message }, 'QEDB SFTP: erro'); }
 
     // PVN — Fase 2 do xml_completo, roda por ÚLTIMO de propósito. A PVN faz a
     // entrega ao cliente final, então o CT-e dela deve prevalecer: quando uma

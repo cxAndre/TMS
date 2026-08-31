@@ -56,11 +56,20 @@ function jsonParaXml(valor, nomeRaiz = 'root') {
   return '<?xml version="1.0" encoding="UTF-8"?>\n' + renderNode(nomeRaiz, valor, 0);
 }
 
-// CNPJ raiz (8 primeiros dígitos) da PVN, presente no <emit><CNPJ> do XML dela.
-// Serve de marca de origem SEM coluna extra: quando o xml_completo já contém
-// este CNPJ, foi a PVN que gravou — e a PVN faz a entrega ao cliente final,
-// então prevalece. Outras fontes (Brudam) não devem sobrescrever.
-const PVN_CNPJ_RAIZ = '12270745';
+// ─── PRECEDÊNCIA DE FONTES DO CT-e ──────────────────────────────────────────
+// Uma mesma NF-e pode ter CT-e de transportadoras diferentes. Quem tem
+// prioridade MAIOR prevalece no xml_completo: cada fonte só grava se o valor
+// atual não for de uma fonte mais forte. A "marca de origem" é o CNPJ raiz do
+// emitente DENTRO do próprio XML — sem coluna extra.
+//   PVN (entrega final) > DDM (entrega ES→SP) > QEDB (Quality) > ACERTA (chegada)
+const CNPJ_PRIORIDADE = {
+  '12270745': 100, // PVN
+  '19355089':  80, // DDM  (DDMLOG)
+  '26510120':  60, // QEDB (Quality)
+  '28486039':  40, // ACERTA
+};
+const PVN_CNPJ_RAIZ = '12270745'; // mantido p/ compat de import
+const prioridadeFonte = cnpjRaiz => CNPJ_PRIORIDADE[String(cnpjRaiz || '').slice(0, 8)] ?? 0;
 
 // ─── GRAVAÇÃO EM LOTE DA COLUNA xml_completo ────────────────────────────────
 /**
@@ -68,15 +77,21 @@ const PVN_CNPJ_RAIZ = '12270745';
  * Cada item: { empresa_id, filial, chave_nfe, xml }.
  * Falhas individuais são logadas mas não interrompem o fluxo.
  * @param {object} [opts]
- * @param {boolean} [opts.protegerPvn] Quando true (fontes que NÃO são a PVN),
- *        só grava se o xml_completo atual for NULL ou não for um CT-e da PVN.
- *        Impede que o Brudam sobrescreva o CT-e da PVN nos runs seguintes.
+ * @param {number} [opts.prioridade] Prioridade desta gravação (ver CNPJ_PRIORIDADE).
+ *        Só grava se o xml_completo atual for NULL ou não contiver o CNPJ de
+ *        nenhuma fonte MAIS FORTE. Impede que uma fonte fraca (ex.: ACERTA)
+ *        sobrescreva uma forte (PVN/DDM/QEDB) nos runs seguintes.
  * @returns {number} quantidade de linhas atualizadas com sucesso
  */
 async function gravarXmlEmLote(supabase, itens, logger, concorrencia = 10, opts = {}) {
   if (!itens?.length) return 0;
   const validos = itens.filter(i => i && i.empresa_id && i.filial && i.chave_nfe && i.xml);
   let ok = 0;
+
+  // CNPJs de fontes mais fortes que esta gravação — não devem ser sobrescritos.
+  const protegidos = opts.prioridade != null
+    ? Object.entries(CNPJ_PRIORIDADE).filter(([, p]) => p > opts.prioridade).map(([c]) => c)
+    : [];
 
   for (let i = 0; i < validos.length; i += concorrencia) {
     const bloco = validos.slice(i, i + concorrencia);
@@ -87,11 +102,13 @@ async function gravarXmlEmLote(supabase, itens, logger, concorrencia = 10, opts 
         .eq('empresa_id', it.empresa_id)
         .eq('filial', it.filial)
         .eq('chave_nfe', it.chave_nfe);
-      // Trava: não sobrescreve um CT-e já gravado pela PVN. Casa quando o
-      // valor atual é NULL ou não contém o CNPJ raiz da PVN. (No PostgREST o
-      // curinga do ilike dentro de .or() é o asterisco.)
-      if (opts.protegerPvn) {
-        q = q.or(`xml_completo.is.null,xml_completo.not.ilike.*${PVN_CNPJ_RAIZ}*`);
+      // Trava de precedência: grava só se NULL ou não contiver CNPJ mais forte.
+      // (No PostgREST o curinga do ilike dentro de .or()/and() é o asterisco.)
+      if (protegidos.length === 1) {
+        q = q.or(`xml_completo.is.null,xml_completo.not.ilike.*${protegidos[0]}*`);
+      } else if (protegidos.length > 1) {
+        const inner = protegidos.map(c => `xml_completo.not.ilike.*${c}*`).join(',');
+        q = q.or(`xml_completo.is.null,and(${inner})`);
       }
       const { error } = await q;
       if (error) throw error;
@@ -104,4 +121,4 @@ async function gravarXmlEmLote(supabase, itens, logger, concorrencia = 10, opts 
   return ok;
 }
 
-module.exports = { jsonParaXml, gravarXmlEmLote, escaparXml, nomeTagValido, PVN_CNPJ_RAIZ };
+module.exports = { jsonParaXml, gravarXmlEmLote, escaparXml, nomeTagValido, PVN_CNPJ_RAIZ, CNPJ_PRIORIDADE, prioridadeFonte };
