@@ -6,7 +6,7 @@
 const path = require('path');
 require('dotenv').config({ path: path.join(__dirname, '.env') });
 const { buscarOcorrenciasQedb } = require('./qedb');
-const { gravarXmlEmLote, prioridadeFonte } = require('./xml-completo');
+const { gravarXmlEmLote } = require('./xml-completo');
 const { criarClienteCteBrudam } = require('./cte-brudam');
 const { processarPastaPvn, processarPastaQedb } = require('./cte-pvn-sftp');
 
@@ -695,11 +695,9 @@ async function processarTransportadoraBrudam(t, execucao_id) {
             const cte = mapaCte.get(String(row.f2_chvnfe).trim());
             if (cte?.xml) cteUpdates.push({ empresa_id: row.empresa_id, filial: row.filial, chave_nfe: String(row.f2_chvnfe).trim(), xml: cte.xml });
           }
-          // Precedência: a prioridade do Brudam vem do CNPJ da própria
-          // transportadora (ACERTA=40, DDM=80). Assim o ACERTA não sobrescreve
-          // PVN/DDM/QEDB, e o DDM não sobrescreve a PVN.
-          const prioridade = prioridadeFonte(String(t.cnpjs?.[0] || '').slice(0, 8));
-          const grav = await gravarXmlEmLote(supabase, cteUpdates, logger, 10, { prioridade });
+          // Precedência pelo CNPJ da própria transportadora: ACERTA (40) não
+          // sobrescreve PVN/DDM/QEDB; DDM (100) não sobrescreve a PVN (par).
+          const grav = await gravarXmlEmLote(supabase, cteUpdates, logger, 10, { cnpjProprio: String(t.cnpjs?.[0] || '') });
           logger.debug({ transportadora: t.name, cte_gravados: grav }, 'CT-e XML atualizado');
         } catch (errCte) {
           logger.warn({ transportadora: t.name, err: errCte.message }, 'CT-e: falha ao buscar/gravar XML do lote (segue)');

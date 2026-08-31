@@ -25,10 +25,10 @@ const TTL_INVALIDO_MS  = parseInt(process.env.SFTP_TTL_INVALIDO_MS|| process.env
 const TTL_SEM_LINHA_MS = parseInt(process.env.SFTP_TTL_SEM_LINHA  || process.env.PVN_TTL_SEM_LINHA_MS|| String(24 * 60 * 60 * 1000), 10);
 const MAX_ARQUIVOS     = parseInt(process.env.SFTP_MAX_ARQUIVOS   || process.env.PVN_MAX_ARQUIVOS   || '300', 10);
 
-// Fontes SFTP: env prefix, usuário padrão e prioridade de precedência.
+// Fontes SFTP: env prefix, usuário padrão e CNPJ raiz (marca de precedência).
 const FONTES = {
-  PVN:  { tag: 'PVN',  envPrefix: 'PVN_SFTP',  userPadrao: 'pvn',  prioridade: 100 },
-  QEDB: { tag: 'QEDB', envPrefix: 'QEDB_SFTP', userPadrao: 'qedb', prioridade: 60  },
+  PVN:  { tag: 'PVN',  envPrefix: 'PVN_SFTP',  userPadrao: 'pvn',  cnpj: '12270745' },
+  QEDB: { tag: 'QEDB', envPrefix: 'QEDB_SFTP', userPadrao: 'qedb', cnpj: '26510120' },
 };
 
 // ─── VALIDAÇÃO / EXTRAÇÃO ────────────────────────────────────────────────────
@@ -126,7 +126,7 @@ function montarConfig(fonte, logger) {
     readyTimeout: parseInt(process.env[`${P}_TIMEOUT`] || '20000', 10),
     // Raiz + Pasta do painel ESL Cloud = /upload/upload. Override por env.
     dir: process.env[`${P}_DIR`] || 'upload/upload',
-    prioridade: fonte.prioridade,
+    cnpj: fonte.cnpj,
     tag: fonte.tag,
   };
 }
@@ -210,8 +210,8 @@ async function processarPastaSftp(supabase, logger, fonte) {
       casados.push(a);
     }
 
-    // Grava respeitando a precedência da fonte (PVN 100 > DDM 80 > QEDB 60 > ACERTA 40).
-    if (itens.length) gravados = await gravarXmlEmLote(supabase, itens, logger, 10, { prioridade: cfg.prioridade });
+    // Grava respeitando a precedência (PVN=DDM > QEDB > ACERTA), via CNPJ da fonte.
+    if (itens.length) gravados = await gravarXmlEmLote(supabase, itens, logger, 10, { cnpjProprio: cfg.cnpj });
 
     for (const a of casados) await moverArquivo(sftp, a.caminho, DIR_PROCESSADO, a.nome, logger, tag);
 

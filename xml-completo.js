@@ -57,19 +57,30 @@ function jsonParaXml(valor, nomeRaiz = 'root') {
 }
 
 // ─── PRECEDÊNCIA DE FONTES DO CT-e ──────────────────────────────────────────
-// Uma mesma NF-e pode ter CT-e de transportadoras diferentes. Quem tem
-// prioridade MAIOR prevalece no xml_completo: cada fonte só grava se o valor
-// atual não for de uma fonte mais forte. A "marca de origem" é o CNPJ raiz do
-// emitente DENTRO do próprio XML — sem coluna extra.
-//   PVN (entrega final) > DDM (entrega ES→SP) > QEDB (Quality) > ACERTA (chegada)
+// Uma mesma NF-e pode ter CT-e de transportadoras diferentes. A "marca de
+// origem" é o CNPJ raiz do emitente DENTRO do XML — sem coluna extra.
+// Regra: uma gravação NÃO sobrescreve outra de prioridade MAIOR, nem um PAR
+// (mesma prioridade, CNPJ diferente). Sobrescreve as MENORES e a si mesma.
+//   PVN = DDM (entrega final, fluxos distintos, não se sobrescrevem)
+//        > QEDB (Quality) > ACERTA (chegada)
 const CNPJ_PRIORIDADE = {
-  '12270745': 100, // PVN
-  '19355089':  80, // DDM  (DDMLOG)
+  '12270745': 100, // PVN   ─┬─ pares: mesma prioridade, um não sobrescreve o outro
+  '19355089': 100, // DDM   ─┘
   '26510120':  60, // QEDB (Quality)
   '28486039':  40, // ACERTA
 };
 const PVN_CNPJ_RAIZ = '12270745'; // mantido p/ compat de import
 const prioridadeFonte = cnpjRaiz => CNPJ_PRIORIDADE[String(cnpjRaiz || '').slice(0, 8)] ?? 0;
+
+// CNPJs que a fonte `cnpjProprio` NÃO deve sobrescrever: os de prioridade maior,
+// mais os pares (prioridade igual, CNPJ diferente). Não inclui a si mesma.
+function cnpjsProtegidos(cnpjProprio) {
+  const meu = String(cnpjProprio || '').slice(0, 8);
+  const minha = CNPJ_PRIORIDADE[meu] ?? 0;
+  return Object.entries(CNPJ_PRIORIDADE)
+    .filter(([c, p]) => p > minha || (p === minha && c !== meu))
+    .map(([c]) => c);
+}
 
 // ─── GRAVAÇÃO EM LOTE DA COLUNA xml_completo ────────────────────────────────
 /**
@@ -77,10 +88,10 @@ const prioridadeFonte = cnpjRaiz => CNPJ_PRIORIDADE[String(cnpjRaiz || '').slice
  * Cada item: { empresa_id, filial, chave_nfe, xml }.
  * Falhas individuais são logadas mas não interrompem o fluxo.
  * @param {object} [opts]
- * @param {number} [opts.prioridade] Prioridade desta gravação (ver CNPJ_PRIORIDADE).
- *        Só grava se o xml_completo atual for NULL ou não contiver o CNPJ de
- *        nenhuma fonte MAIS FORTE. Impede que uma fonte fraca (ex.: ACERTA)
- *        sobrescreva uma forte (PVN/DDM/QEDB) nos runs seguintes.
+ * @param {string} [opts.cnpjProprio] CNPJ raiz da fonte desta gravação. Só grava
+ *        se o xml_completo atual for NULL ou não contiver o CNPJ de uma fonte
+ *        mais forte ou par (ver cnpjsProtegidos). Impede que ACERTA sobrescreva
+ *        PVN/DDM/QEDB, e que PVN e DDM se sobrescrevam entre si.
  * @returns {number} quantidade de linhas atualizadas com sucesso
  */
 async function gravarXmlEmLote(supabase, itens, logger, concorrencia = 10, opts = {}) {
@@ -88,10 +99,8 @@ async function gravarXmlEmLote(supabase, itens, logger, concorrencia = 10, opts 
   const validos = itens.filter(i => i && i.empresa_id && i.filial && i.chave_nfe && i.xml);
   let ok = 0;
 
-  // CNPJs de fontes mais fortes que esta gravação — não devem ser sobrescritos.
-  const protegidos = opts.prioridade != null
-    ? Object.entries(CNPJ_PRIORIDADE).filter(([, p]) => p > opts.prioridade).map(([c]) => c)
-    : [];
+  // CNPJs que esta gravação não pode sobrescrever (mais fortes + pares).
+  const protegidos = opts.cnpjProprio != null ? cnpjsProtegidos(opts.cnpjProprio) : [];
 
   for (let i = 0; i < validos.length; i += concorrencia) {
     const bloco = validos.slice(i, i + concorrencia);
@@ -121,4 +130,4 @@ async function gravarXmlEmLote(supabase, itens, logger, concorrencia = 10, opts 
   return ok;
 }
 
-module.exports = { jsonParaXml, gravarXmlEmLote, escaparXml, nomeTagValido, PVN_CNPJ_RAIZ, CNPJ_PRIORIDADE, prioridadeFonte };
+module.exports = { jsonParaXml, gravarXmlEmLote, escaparXml, nomeTagValido, PVN_CNPJ_RAIZ, CNPJ_PRIORIDADE, prioridadeFonte, cnpjsProtegidos };
