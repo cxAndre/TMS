@@ -91,8 +91,8 @@ const dia = d => new Date(d).toLocaleDateString('pt-BR', { timeZone: 'America/Sa
         a[0].split('/').reverse().join('').localeCompare(b[0].split('/').reverse().join('')));
       console.log('  ' + n.padEnd(8), dias.length ? dias.map(([d, q]) => `${d.slice(0, 5)}=${q}`).join('  ') : 'nenhuma');
     }
-    console.log('\nObs.: ACERTA/DDM têm a linha atualizada a cada execução do ETL (rastreio), então');
-    console.log('"última gravação" delas não significa CT-e novo. Para PVN/QUALITY (SFTP) significa.');
+    console.log('\nObs.: atualizado_em é da LINHA, não do XML: rastreio Brudam/QEDB/ESL da mesma NF-e');
+    console.log('também a atualiza. Use a emissão do CT-e (ou o log do ETL) para saber quando chegou CT-e novo.');
   }
   process.exit(0);
 })().catch(e => { console.error('ERRO:', e.message); process.exit(1); });
