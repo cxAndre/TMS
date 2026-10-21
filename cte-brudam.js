@@ -53,9 +53,12 @@ function mapearCtePorNota(chavesPedidas, itens) {
   return mapa;
 }
 
-// Cliente que tenta TODAS as contas e usa a que libera o XML.
+// Cliente que tenta TODAS as contas e junta o que cada uma libera, por NF-e.
 // Motivo: em alguns Brudam (ex.: DDM) só uma das contas tem permissão de
-// download de XML de CT-e; a outra devolve status 0 "Proibido".
+// download de XML de CT-e; a outra devolve status 0 "Proibido". A permissão é
+// por CT-e, não por conta: a conta 1 da DDM libera alguns XML e nega o resto
+// no MESMO lote, então só passar à próxima conta quando nada vier liberado
+// deixava de fora as NF-e que só a conta 2 libera.
 function criarClienteCteBrudam({ base, authUrl, accounts, user, pass }) {
   // aceita accounts:[{user,pass}] ou o par avulso {user,pass} (compat)
   const contas = (accounts && accounts.length ? accounts : [{ user, pass }])
@@ -82,17 +85,18 @@ function criarClienteCteBrudam({ base, authUrl, accounts, user, pass }) {
   }
 
   async function buscar(chaves) {
-    let ultimoItens = [];
+    const mapa = new Map();
+    let pendentes = chaves;
     for (const conta of contas) {
+      if (!pendentes.length) break;
       let itens;
-      try { itens = await chamarConta(conta, chaves); }
+      try { itens = await chamarConta(conta, pendentes); }
       catch { continue; } // conta falhou → tenta a próxima
-      ultimoItens = itens;
-      // se esta conta liberou algum XML, é a boa
-      if (itens.some(it => it.status === 1 && it.xml)) return mapearCtePorNota(chaves, itens);
+      // só as NF-e que esta conta liberou; o resto segue para a próxima conta
+      for (const [chave, cte] of mapearCtePorNota(pendentes, itens)) mapa.set(chave, cte);
+      pendentes = pendentes.filter(c => !mapa.has(c));
     }
-    // nenhuma conta liberou XML (Proibido ou sem CT-e) → mapeia o que houver
-    return mapearCtePorNota(chaves, ultimoItens);
+    return mapa;
   }
 
   return { buscar };
