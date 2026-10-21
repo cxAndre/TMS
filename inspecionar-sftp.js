@@ -40,7 +40,7 @@ function motivo(xml) {
     const pistas = [];
     const tp = tag(xml, 'tpCTe');
     if (tp && tp !== '0') pistas.push(`CT-e ${TIPO[tp] || tp}`);
-    if (xml.includes('<infCteComp')) pistas.push('complementa outro CT-e');
+    if (xml.includes('<infCteComp')) pistas.push('complementa outro CT-e (o ETL grava em tms_cte_complementar; volte para upload/upload para reprocessar)');
     if (xml.includes('<infNF>')) pistas.push('NF em papel (infNF, sem chave)');
     if (xml.includes('<infOutros')) pistas.push('outros documentos (infOutros)');
     if (/<chNFe>\d{44}<\/chNFe>/.test(xml)) pistas.push('chave em <chNFe> (tag que o ETL não lê)');
