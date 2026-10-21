@@ -2,13 +2,17 @@
 // Preenche tms_monitoramento_entregas.xml_completo com o XML FISCAL DO CT-e
 // (Brudam /dfe/cte/nota), buscando pela chave da NF-e que já temos.
 //
-// - Linhas Brudam (Acerta/DDM): xml_completo = XML do CT-e (ou NULL se não achar).
-// - Linhas QEDB/ESL (Fase 2): xml_completo = NULL (limpa o dado antigo).
+// Padrão SEGURO: só linhas Brudam (Acerta/DDM) com xml_completo NULL. Não toca
+// em linha que já tem XML — hoje PVN e Quality (SFTP) gravam em linhas ESL/QEDB
+// e também em linhas da ACERTA (precedência), então sobrescrever ou limpar
+// apagaria esses CT-e.
 //
 // Uso:
-//   node backfill-cte.js                 -> limpa não-Brudam + backfill Brudam
-//   node backfill-cte.js --limit 20      -> só 20 linhas por transportadora (teste)
-//   node backfill-cte.js --so-brudam     -> não mexe nas linhas QEDB/ESL
+//   node backfill-cte.js                     -> preenche só as linhas Brudam vazias
+//   node backfill-cte.js --limit 20          -> só 20 linhas por transportadora (teste)
+//   node backfill-cte.js --todas             -> refaz TODAS as linhas Brudam (sobrescreve, inclusive PVN)
+//   node backfill-cte.js --limpar-nao-brudam -> NULL em linhas QEDB/ESL (apaga PVN/Quality!)
+// (--so-brudam e --so-vazias são aceitos por compatibilidade; já são o padrão)
 'use strict';
 
 const path = require('path');
@@ -25,8 +29,8 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY
 const args = process.argv.slice(2);
 const idxLimit = args.indexOf('--limit');
 const LIMITE = idxLimit >= 0 ? parseInt(args[idxLimit + 1], 10) : null;
-const SO_BRUDAM = args.includes('--so-brudam');
-const SO_VAZIAS = args.includes('--so-vazias'); // só linhas Brudam com xml_completo null
+const SO_BRUDAM = !args.includes('--limpar-nao-brudam');
+const SO_VAZIAS = !args.includes('--todas'); // padrão: só linhas Brudam com xml_completo null
 const PAGINA = 1000;
 const SLEEP_LOTE_MS = 400;
 
@@ -49,9 +53,12 @@ async function setXmlCompleto(itens, conc = 8) {
   for (let i = 0; i < itens.length; i += conc) {
     const bloco = itens.slice(i, i + conc);
     const res = await Promise.allSettled(bloco.map(async it => {
-      const { error } = await supabase.from('tms_monitoramento_entregas')
+      let q = supabase.from('tms_monitoramento_entregas')
         .update({ xml_completo: it.xml ?? null })
         .eq('empresa_id', it.empresa_id).eq('filial', it.filial).eq('chave_nfe', it.chave_nfe);
+      // só vazias: se o ETL gravou (ex.: PVN) depois da coleta, não sobrescreve
+      if (SO_VAZIAS) q = q.is('xml_completo', null);
+      const { error } = await q;
       if (error) throw error;
     }));
     for (const r of res) { if (r.status === 'fulfilled') ok++; else logger.warn({ err: r.reason?.message }, 'falha ao atualizar xml_completo'); }
@@ -110,7 +117,8 @@ async function backfillCarrier(carrier) {
       if (cte?.xml) comCte++; else semCte++;
       return { empresa_id: r.empresa_id, filial: r.filial, chave_nfe: r.chave_nfe, xml: cte?.xml || null };
     });
-    await setXmlCompleto(upd);
+    // só vazias: linha sem CT-e já está NULL, não precisa de update
+    await setXmlCompleto(SO_VAZIAS ? upd.filter(u => u.xml) : upd);
     processadas += lote.length;
     if (processadas % 1000 < LIMITE_CHAVES) logger.info({ carrier: carrier.name, processadas, comCte, semCte }, 'CT-e backfill: progresso');
     await sleep(SLEEP_LOTE_MS);
