@@ -14,7 +14,7 @@
 'use strict';
 
 const SftpClient = require('ssh2-sftp-client');
-const { gravarXmlEmLote } = require('./xml-completo');
+const { gravarXmlEmLote, gravarCteXml } = require('./xml-completo');
 
 const DIR_PROCESSADO = 'processado';
 const DIR_ERRO       = 'erro';
@@ -174,6 +174,9 @@ async function processarEventos(sftp, supabase, logger, cfg, eventos) {
       const del = await supabase.from('tms_cte_complementar').delete({ count: 'exact' }).eq('chave_cte', ev.chCte);
       if (del.error) logger.warn({ err: del.error.message }, `${tag}: cancelamento — falha ao limpar complementar`);
       else complementares = del.count || 0;
+      // tms_cte_nfe sai junto (on delete cascade)
+      const delCte = await supabase.from('tms_cte_xml').delete().eq('chave_cte', ev.chCte);
+      if (delCte.error) logger.warn({ err: delCte.error.message }, `${tag}: cancelamento — falha ao limpar tms_cte_xml`);
 
       const original = processado.find(f => f.name.startsWith(ev.chCte) && !/-eve/i.test(f.name));
       if (original) {
@@ -374,6 +377,8 @@ async function processarPastaSftp(supabase, logger, fonte) {
 
     // Grava respeitando a precedência (PVN=DDM > QEDB > ACERTA), via CNPJ da fonte.
     if (itens.length) gravados = await gravarXmlEmLote(supabase, itens, logger, 10, { cnpjProprio: cfg.cnpj });
+    // tms_cte_xml: o CT-e desta perna, mesmo quando a precedência não o pôs em xml_completo.
+    if (itens.length) await gravarCteXml(supabase, itens.map(i => ({ ...i, papel: 'ENTREGA', fonte: tag })), logger);
 
     for (const a of casados) await moverArquivo(sftp, a.caminho, DIR_PROCESSADO, a.nome, logger, tag);
 

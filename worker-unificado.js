@@ -6,7 +6,7 @@
 const path = require('path');
 require('dotenv').config({ path: path.join(__dirname, '.env') });
 const { buscarOcorrenciasQedb } = require('./qedb');
-const { gravarXmlEmLote } = require('./xml-completo');
+const { gravarXmlEmLote, gravarCteXml } = require('./xml-completo');
 const { criarClienteCteBrudam } = require('./cte-brudam');
 const { processarPastaPvn, processarPastaQedb } = require('./cte-pvn-sftp');
 
@@ -503,6 +503,36 @@ async function salvarRegistros(registros) {
   return validos.length;
 }
 
+// ─── PERNA ADICIONAL ──────────────────────────────────────────────────────────
+async function chavesExistentes(chaves) {
+  const existe = new Set();
+  for (let i = 0; i < chaves.length; i += 100) {
+    const { data, error } = await supabase.from('tms_monitoramento_entregas')
+      .select('chave_nfe').in('chave_nfe', chaves.slice(i, i + 100));
+    if (error) throw new Error(`Lookup perna adicional: ${error.message}`);
+    for (const d of data || []) existe.add(d.chave_nfe);
+  }
+  return existe;
+}
+
+// Entrega e canhoto da perna adicional entram na linha principal só onde
+// estão vazios: nunca trocam as datas da transportadora dona da linha.
+async function completarEntregaSeVazia(registros) {
+  const updates = [];
+  for (const r of registros) {
+    for (const campo of ['dt_entregue', 'dt_canhoto']) {
+      if (r[campo]) updates.push({ r, campo });
+    }
+  }
+  for (let i = 0; i < updates.length; i += 10) {
+    await Promise.all(updates.slice(i, i + 10).map(async ({ r, campo }) => {
+      const { error } = await supabase.from('tms_monitoramento_entregas').update({ [campo]: r[campo] })
+        .eq('empresa_id', r.empresa_id).eq('filial', r.filial).eq('chave_nfe', r.chave_nfe).is(campo, null);
+      if (error) logger.warn({ err: error.message, campo }, 'Perna adicional: falha ao completar data (segue)');
+    }));
+  }
+}
+
 // ─── TMS_CTES (tabela filha: 1 linha por CT-e / perna de frete) ──────────────
 // Uma NF-e transferida entre bases (ES→CD SP) tem vários CT-e: ACERTA leva até
 // o CD (papel CHEGADA) e DDM/PVN entrega ao cliente (papel ENTREGA). A tabela
@@ -592,6 +622,14 @@ async function processarTransportadoraBrudam(t, execucao_id) {
     const loteChaves = loteRows.map(r => r.f2_chvnfe);
     stats.consultadas += loteChaves.length;
     let processado = false, ultimoErro = null;
+    // Perna adicional: NF-e cujo CNPJ de transportadora no Protheus é de OUTRA
+    // raiz (ex.: "ACERTA - DDMLOG" 28486039000341, também consultado na DDM).
+    // A linha principal é da dona do CNPJ: aqui ela só é criada se ainda não
+    // existe; se existe, a perna só completa entrega/canhoto vazios.
+    const raizPropria = String(t.cnpjs?.[0] || '').replace(/\D/g, '').slice(0, 8);
+    const adicional = new Set(loteRows
+      .filter(r => String(r.cnpj_transportador || '').replace(/\D/g, '').slice(0, 8) !== raizPropria)
+      .map(r => String(r.f2_chvnfe).trim()));
 
     for (const account of t.accounts) {
       try {
@@ -684,20 +722,32 @@ async function processarTransportadoraBrudam(t, execucao_id) {
           }
         }
 
-        stats.novas += await salvarRegistros(registros);
+        const existentes = adicional.size ? await chavesExistentes([...adicional]) : new Set();
+        const daOutra = c => adicional.has(c) && existentes.has(c);
+
+        stats.novas += await salvarRegistros(registros.filter(r => !daOutra(r.chave_nfe)));
+        await completarEntregaSeVazia(registros.filter(r => daOutra(r.chave_nfe)));
         await salvarCtes(registrosOc, t.papel || 'ENTREGA'); // perna: ACERTA=CHEGADA, DDM=ENTREGA (via transportadoras.json)
 
-        // xml_completo: XML fiscal do CT-e (Brudam /dfe/cte/nota), por chave da NF-e
+        // CT-e: XML fiscal (Brudam /dfe/cte/nota), por chave da NF-e
         try {
           const mapaCte = await clienteCte.buscar(loteChaves);
-          const cteUpdates = [];
+          const proprias = [], adicionais = [], porPerna = [];
           for (const row of loteRows) {
-            const cte = mapaCte.get(String(row.f2_chvnfe).trim());
-            if (cte?.xml) cteUpdates.push({ empresa_id: row.empresa_id, filial: row.filial, chave_nfe: String(row.f2_chvnfe).trim(), xml: cte.xml });
+            const chave = String(row.f2_chvnfe).trim();
+            const cte = mapaCte.get(chave);
+            if (!cte?.xml) continue;
+            const it = { empresa_id: row.empresa_id, filial: row.filial, chave_nfe: chave, xml: cte.xml };
+            (adicional.has(chave) ? adicionais : proprias).push(it);
+            porPerna.push({ ...it, papel: t.papel || 'ENTREGA', fonte: t.name });
           }
-          // Precedência pelo CNPJ da própria transportadora: ACERTA (40) não
-          // sobrescreve PVN/DDM/QEDB; DDM (100) não sobrescreve a PVN (par).
-          const grav = await gravarXmlEmLote(supabase, cteUpdates, logger, 10, { cnpjProprio: String(t.cnpjs?.[0] || '') });
+          // xml_completo — precedência pelo CNPJ da própria transportadora: ACERTA
+          // (40) não sobrescreve PVN/DDM/QEDB; DDM (100) não sobrescreve a PVN (par).
+          // Perna adicional só preenche linha sem CT-e (não troca o da dona).
+          const grav = await gravarXmlEmLote(supabase, proprias, logger, 10, { cnpjProprio: String(t.cnpjs?.[0] || '') })
+                     + await gravarXmlEmLote(supabase, adicionais, logger, 10, { soVazias: true });
+          // tms_cte_xml: todo CT-e, de toda perna, sem precedência.
+          await gravarCteXml(supabase, porPerna, logger);
           logger.debug({ transportadora: t.name, cte_gravados: grav }, 'CT-e XML atualizado');
         } catch (errCte) {
           logger.warn({ transportadora: t.name, err: errCte.message }, 'CT-e: falha ao buscar/gravar XML do lote (segue)');
@@ -719,7 +769,7 @@ async function processarTransportadoraBrudam(t, execucao_id) {
       stats.erros += loteChaves.length;
       const msg = `Brudam: todas as contas falharam — ${t.name}${ultimoErro ? ` (${ultimoErro.message})` : ''}`;
       logger.error({ transportadora: t.name }, msg);
-      await gravarErroNaEntrega(loteRows, msg);
+      await gravarErroNaEntrega(loteRows.filter(r => !adicional.has(String(r.f2_chvnfe).trim())), msg); // não marca linha de outra transportadora
     }
     await sleep(SLEEP_ENTRE_LOTES_MS);
   }
