@@ -27,7 +27,8 @@
       "base": "https://ddmlog.brudam.com.br",
       "auth_url": "https://ddmlog.brudam.com.br/api/v1/acesso/auth/login",
       "cnpjs": [
-        "19355089000137"
+        "19355089000137",
+        "28486039000341"
       ],
       "accounts": [
         {

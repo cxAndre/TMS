@@ -92,6 +92,7 @@ function cnpjsProtegidos(cnpjProprio) {
  *        se o xml_completo atual for NULL ou não contiver o CNPJ de uma fonte
  *        mais forte ou par (ver cnpjsProtegidos). Impede que ACERTA sobrescreva
  *        PVN/DDM/QEDB, e que PVN e DDM se sobrescrevam entre si.
+ * @param {boolean} [opts.soVazias] Só grava onde xml_completo é NULL.
  * @returns {number} quantidade de linhas atualizadas com sucesso
  */
 async function gravarXmlEmLote(supabase, itens, logger, concorrencia = 10, opts = {}) {
@@ -113,7 +114,9 @@ async function gravarXmlEmLote(supabase, itens, logger, concorrencia = 10, opts 
         .eq('chave_nfe', it.chave_nfe);
       // Trava de precedência: grava só se NULL ou não contiver CNPJ mais forte.
       // (No PostgREST o curinga do ilike dentro de .or()/and() é o asterisco.)
-      if (protegidos.length === 1) {
+      // soVazias: perna adicional (ex.: DDM numa NF-e da ACERTA) só preenche linha sem CT-e.
+      if (opts.soVazias) q = q.is('xml_completo', null);
+      else if (protegidos.length === 1) {
         q = q.or(`xml_completo.is.null,xml_completo.not.ilike.*${protegidos[0]}*`);
       } else if (protegidos.length > 1) {
         const inner = protegidos.map(c => `xml_completo.not.ilike.*${c}*`).join(',');
@@ -130,4 +133,63 @@ async function gravarXmlEmLote(supabase, itens, logger, concorrencia = 10, opts 
   return ok;
 }
 
-module.exports = { jsonParaXml, gravarXmlEmLote, escaparXml, nomeTagValido, PVN_CNPJ_RAIZ, CNPJ_PRIORIDADE, prioridadeFonte, cnpjsProtegidos };
+// ─── CT-e POR PERNA (tms_cte_xml + tms_cte_nfe) ─────────────────────────────
+// xml_completo guarda UM CT-e por NF-e; numa NF-e com redespacho (ACERTA leva
+// ES→SP, DDM/PVN entrega) os outros se perdiam. Aqui fica TODO CT-e recebido:
+// tms_cte_xml uma linha por CT-e, tms_cte_nfe uma por (CT-e, NF-e).
+// Ver consultas/tms_cte_xml.sql.
+const NOME_TRANSPORTADORA = { '12270745': 'PVN', '19355089': 'DDM', '26510120': 'QUALITY', '28486039': 'ACERTA' };
+
+const tagXml = (xml, nome) => (xml.match(new RegExp(`<${nome}>([^<]+)</${nome}>`)) || [])[1] || null;
+
+function dadosDoCte(xml) {
+  const cnpj = (xml.match(/<emit>[\s\S]*?<CNPJ>(\d{14})<\/CNPJ>/) || [])[1] || null;
+  const vTPrest = parseFloat(tagXml(xml, 'vTPrest'));
+  return {
+    chave_cte: (xml.match(/<infCte[^>]*Id="CTe(\d{44})"/) || [])[1]
+            || (xml.match(/<protCTe[\s\S]*?<chCTe>(\d{44})<\/chCTe>/) || [])[1] || null,
+    cnpj_emitente: cnpj,
+    transportadora: NOME_TRANSPORTADORA[String(cnpj || '').slice(0, 8)] || null,
+    tp_cte: tagXml(xml, 'tpCTe'),
+    n_ct: tagXml(xml, 'nCT'),
+    dh_emi: tagXml(xml, 'dhEmi'),
+    v_tprest: Number.isFinite(vTPrest) ? vTPrest : null,
+    c_stat: (xml.match(/<infProt[\s\S]*?<cStat>(\d+)<\/cStat>/) || [])[1] || null,
+  };
+}
+
+/**
+ * Grava CT-e em tms_cte_xml/tms_cte_nfe. Não toca em xml_completo.
+ * Cada item: { xml, empresa_id, filial, chave_nfe, papel, fonte }.
+ * Falha (ex.: tabela ainda não criada) só registra aviso: não derruba o fluxo.
+ * @returns {number} CT-e gravados
+ */
+async function gravarCteXml(supabase, itens, logger) {
+  const ctes = new Map(), nfes = new Map();
+  for (const it of itens || []) {
+    if (!it?.xml || !it.chave_nfe) continue;
+    const d = dadosDoCte(it.xml);
+    if (!d.chave_cte) continue;
+    if (!ctes.has(d.chave_cte)) ctes.set(d.chave_cte, { ...d, papel: it.papel || null, xml: it.xml, fonte: it.fonte || null });
+    nfes.set(`${d.chave_cte}|${it.chave_nfe}`, { chave_cte: d.chave_cte, chave_nfe: it.chave_nfe, empresa_id: it.empresa_id || null, filial: it.filial || null });
+  }
+  if (!ctes.size) return 0;
+  try {
+    const linhas = [...ctes.values()];
+    for (let i = 0; i < linhas.length; i += 50) {
+      const { error } = await supabase.from('tms_cte_xml').upsert(linhas.slice(i, i + 50), { onConflict: 'chave_cte' });
+      if (error) throw error;
+    }
+    const pares = [...nfes.values()];
+    for (let i = 0; i < pares.length; i += 500) {
+      const { error } = await supabase.from('tms_cte_nfe').upsert(pares.slice(i, i + 500), { onConflict: 'chave_cte,chave_nfe' });
+      if (error) throw error;
+    }
+  } catch (err) {
+    if (logger) logger.warn({ err: err.message }, 'tms_cte_xml: falha ao gravar (segue)');
+    return 0;
+  }
+  return ctes.size;
+}
+
+module.exports = { jsonParaXml, gravarXmlEmLote, gravarCteXml, dadosDoCte, NOME_TRANSPORTADORA, escaparXml, nomeTagValido, PVN_CNPJ_RAIZ, CNPJ_PRIORIDADE, prioridadeFonte, cnpjsProtegidos };
