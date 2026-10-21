@@ -43,6 +43,14 @@ function extrairChavesNfe(xml) {
   const achadas = xml.match(/<chave>(\d{44})<\/chave>/g) || [];
   return [...new Set(achadas.map(t => t.replace(/\D/g, '')))];
 }
+// CT-e complementar (tpCTe=1) não cita NF-e: aponta para o CT-e original.
+function chaveCteOriginal(xml) {
+  return (xml.match(/<infCteComp>[\s\S]*?<chCTe>(\d{44})<\/chCTe>/) || [])[1] || null;
+}
+function chaveCteDoXml(xml) {
+  return (xml.match(/<infCte[^>]*Id="CTe(\d{44})"/) || [])[1] || null;
+}
+const tagXml = (xml, nome) => (xml.match(new RegExp(`<${nome}>([^<]+)</${nome}>`)) || [])[1] || null;
 
 // ─── LOOKUP ──────────────────────────────────────────────────────────────────
 // gravarXmlEmLote exige empresa_id + filial + chave_nfe, mas do arquivo só sai
@@ -131,6 +139,77 @@ function montarConfig(fonte, logger) {
   };
 }
 
+// ─── CT-e COMPLEMENTAR ───────────────────────────────────────────────────────
+// O complementar não cita NF-e, só o CT-e original: as NF-e saem do XML do
+// original (desta rodada ou já em processado/, cujo nome começa pela chave).
+// Grava em tms_cte_complementar (ver consultas/tms_cte_complementar.sql), não em
+// xml_completo, que guarda o CT-e original. Se a gravação falhar (ex.: tabela
+// ainda não criada), os arquivos ficam em upload/ e voltam na próxima rodada.
+async function processarComplementares(sftp, supabase, logger, cfg, comps, arquivosDaRodada) {
+  const tag = cfg.tag;
+  const nfesPorCte = new Map();
+  for (const a of arquivosDaRodada) { const k = chaveCteDoXml(a.xml); if (k) nfesPorCte.set(k, a.chaves); }
+
+  const faltam = [...new Set(comps.map(c => c.original))].filter(k => !nfesPorCte.has(k));
+  if (faltam.length && await sftp.exists(`/${DIR_PROCESSADO}`)) {
+    const porChave = new Map();
+    for (const f of await sftp.list(`/${DIR_PROCESSADO}`)) {
+      const k = (f.name.match(/^(\d{44})/) || [])[1];
+      if (f.type === '-' && k && !porChave.has(k)) porChave.set(k, f.name);
+    }
+    for (const k of faltam) {
+      const nome = porChave.get(k);
+      if (!nome) continue;
+      try { nfesPorCte.set(k, extrairChavesNfe((await sftp.get(`/${DIR_PROCESSADO}/${nome}`)).toString('utf8'))); }
+      catch (err) { logger.warn({ arquivo: nome, err: err.message }, `${tag}: falha ao ler CT-e original`); }
+    }
+  }
+
+  const todasNfes = [...new Set(comps.flatMap(c => nfesPorCte.get(c.original) || []))];
+  const mapa = todasNfes.length ? await resolverLinhas(supabase, todasNfes) : new Map();
+
+  const linhas = new Map(); // chave_cte|chave_nfe -> linha (upsert não aceita PK repetida)
+  const casados = [];
+  for (const c of comps) {
+    const nfes = nfesPorCte.get(c.original) || [];
+    const destinos = nfes.flatMap(n => (mapa.get(n) || []).map(d => ({ ...d, chave_nfe: n })));
+    const chaveCte = chaveCteDoXml(c.xml);
+    if (!destinos.length || !chaveCte) {
+      if (c.idade > TTL_SEM_LINHA_MS) {
+        await moverArquivo(sftp, c.caminho, DIR_ERRO, c.nome, logger, tag);
+        const motivo = !chaveCte ? 'sem chave do próprio CT-e' : !nfes.length ? 'CT-e original não encontrado' : 'NF-e do original fora do banco';
+        logger.warn({ arquivo: c.nome, original: c.original, motivo }, `${tag}: complementar sem destino além do prazo → erro/`);
+      }
+      continue;
+    }
+    const vTPrest = parseFloat(tagXml(c.xml, 'vTPrest'));
+    for (const d of destinos) {
+      linhas.set(`${chaveCte}|${d.chave_nfe}`, {
+        chave_cte: chaveCte, chave_nfe: d.chave_nfe, chave_cte_original: c.original,
+        empresa_id: d.empresa_id, filial: d.filial,
+        cnpj_emitente: (c.xml.match(/<emit>[\s\S]*?<CNPJ>(\d{14})<\/CNPJ>/) || [])[1] || null,
+        n_ct: tagXml(c.xml, 'nCT'), dh_emi: tagXml(c.xml, 'dhEmi'),
+        v_tprest: Number.isFinite(vTPrest) ? vTPrest : null,
+        xml: c.xml, fonte: tag,
+      });
+    }
+    casados.push(c);
+  }
+  if (!linhas.size) return 0;
+
+  const todas = [...linhas.values()];
+  for (let i = 0; i < todas.length; i += 100) {
+    const { error } = await supabase.from('tms_cte_complementar').upsert(todas.slice(i, i + 100), { onConflict: 'chave_cte,chave_nfe' });
+    if (error) {
+      logger.warn({ err: error.message, arquivos: casados.length }, `${tag}: falha ao gravar complementares (ficam em upload/ para a próxima rodada)`);
+      return 0;
+    }
+  }
+  for (const c of casados) await moverArquivo(sftp, c.caminho, DIR_PROCESSADO, c.nome, logger, tag);
+  logger.info({ arquivos: casados.length, linhas: linhas.size }, `${tag}: CT-e complementares gravados`);
+  return linhas.size;
+}
+
 // ─── FLUXO GENÉRICO ──────────────────────────────────────────────────────────
 async function processarPastaSftp(supabase, logger, fonte) {
   const cfg = montarConfig(fonte, logger);
@@ -166,6 +245,7 @@ async function processarPastaSftp(supabase, logger, fonte) {
 
     // 1ª passada: baixa, valida, extrai chaves.
     const arquivos = [];
+    const complementares = [];
     for (const f of candidatos) {
       const caminho = `/${DIR_UPLOAD}/${f.name}`;
       let xml;
@@ -182,12 +262,15 @@ async function processarPastaSftp(supabase, logger, fonte) {
       }
       const chaves = extrairChavesNfe(xml);
       if (!chaves.length) {
+        const original = chaveCteOriginal(xml);
+        if (original) { complementares.push({ nome: f.name, caminho, xml, original, idade }); continue; }
         await moverArquivo(sftp, caminho, DIR_ERRO, f.name, logger, tag);
         logger.warn({ arquivo: f.name }, `${tag}: CT-e sem chave de NF-e → erro/`);
         continue;
       }
       arquivos.push({ nome: f.name, caminho, xml, chaves, idade });
     }
+    if (complementares.length) await processarComplementares(sftp, supabase, logger, cfg, complementares, arquivos);
     if (!arquivos.length) return 0;
 
     // 2ª passada: um único lookup para todas as chaves.
@@ -229,4 +312,5 @@ const processarPastaQedb = (supabase, logger) => processarPastaSftp(supabase, lo
 module.exports = {
   processarPastaPvn, processarPastaQedb, processarPastaSftp, FONTES,
   extrairChavesNfe, xmlCompleto, ehCte, resolverLinhas, normalizarChave, formaDaChave,
+  chaveCteOriginal, chaveCteDoXml,
 };
