@@ -139,6 +139,68 @@ function montarConfig(fonte, logger) {
   };
 }
 
+// ─── EVENTOS (cancelamento) ──────────────────────────────────────────────────
+// Evento do CT-e (procEventoCTe, arquivo "-eve.xml"). Só o cancelamento
+// (tpEvento 110111) registrado na SEFAZ (cStat 135/136) muda algo no banco.
+function lerEvento(xml) {
+  if (!/<(procEventoCTe|eventoCTe)[\s>]/.test(xml)) return null;
+  return {
+    chCte: (xml.match(/<infEvento[\s\S]*?<chCTe>(\d{44})<\/chCTe>/) || [])[1] || null,
+    tpEvento: tagXml(xml, 'tpEvento'),
+    cStat: (xml.match(/<retEventoCTe[\s\S]*?<cStat>(\d+)<\/cStat>/) || [])[1] || null,
+  };
+}
+
+// Aplica os cancelamentos: apaga o complementar cancelado e tira o XML do CT-e
+// cancelado das linhas que o têm (a ACERTA ou o próprio ETL regravam depois o
+// CT-e válido dessas notas). As NF-e do cancelado saem do XML dele em
+// processado/. Devolve as chaves canceladas (desta rodada e de eventos já em
+// processado/) para não gravar um CT-e cancelado que chegue depois.
+async function processarEventos(sftp, supabase, logger, cfg, eventos) {
+  const tag = cfg.tag;
+  const canceladas = new Set();
+  const temProcessado = await sftp.exists(`/${DIR_PROCESSADO}`);
+  const processado = temProcessado ? (await sftp.list(`/${DIR_PROCESSADO}`)).filter(f => f.type === '-') : [];
+  for (const f of processado) {
+    const k = (f.name.match(/^(\d{44}).*-eve/i) || [])[1];
+    if (k) canceladas.add(k);
+  }
+
+  for (const ev of eventos) {
+    const cancela = ev.tpEvento === '110111' && ['135', '136'].includes(ev.cStat) && ev.chCte;
+    if (cancela) {
+      canceladas.add(ev.chCte);
+      let complementares = 0, linhas = 0;
+      const del = await supabase.from('tms_cte_complementar').delete({ count: 'exact' }).eq('chave_cte', ev.chCte);
+      if (del.error) logger.warn({ err: del.error.message }, `${tag}: cancelamento — falha ao limpar complementar`);
+      else complementares = del.count || 0;
+
+      const original = processado.find(f => f.name.startsWith(ev.chCte) && !/-eve/i.test(f.name));
+      if (original) {
+        let nfes = [];
+        try { nfes = extrairChavesNfe((await sftp.get(`/${DIR_PROCESSADO}/${original.name}`)).toString('utf8')); }
+        catch (err) { logger.warn({ arquivo: original.name, err: err.message }, `${tag}: cancelamento — falha ao ler CT-e`); }
+        const mapa = nfes.length ? await resolverLinhas(supabase, nfes) : new Map();
+        for (const [chave, destinos] of mapa) {
+          for (const d of destinos) {
+            const { error, count } = await supabase.from('tms_monitoramento_entregas')
+              .update({ xml_completo: null }, { count: 'exact' })
+              .eq('empresa_id', d.empresa_id).eq('filial', d.filial).eq('chave_nfe', chave)
+              .like('xml_completo', `%${ev.chCte}%`);
+            if (error) logger.warn({ err: error.message }, `${tag}: cancelamento — falha ao limpar xml_completo`);
+            else linhas += count || 0;
+          }
+        }
+      }
+      logger.info({ cte: ev.chCte, complementares_apagados: complementares, linhas_limpas: linhas }, `${tag}: CT-e cancelado aplicado`);
+    } else {
+      logger.info({ arquivo: ev.nome, tpEvento: ev.tpEvento, cStat: ev.cStat }, `${tag}: evento sem efeito no banco`);
+    }
+    await moverArquivo(sftp, ev.caminho, DIR_PROCESSADO, ev.nome, logger, tag);
+  }
+  return canceladas;
+}
+
 // ─── CT-e COMPLEMENTAR ───────────────────────────────────────────────────────
 // O complementar não cita NF-e, só o CT-e original: as NF-e saem do XML do
 // original (desta rodada ou já em processado/, cujo nome começa pela chave).
@@ -244,8 +306,9 @@ async function processarPastaSftp(supabase, logger, fonte) {
     if (!candidatos.length) return 0;
 
     // 1ª passada: baixa, valida, extrai chaves.
-    const arquivos = [];
-    const complementares = [];
+    let arquivos = [];
+    let complementares = [];
+    const eventos = [];
     for (const f of candidatos) {
       const caminho = `/${DIR_UPLOAD}/${f.name}`;
       let xml;
@@ -253,6 +316,8 @@ async function processarPastaSftp(supabase, logger, fonte) {
       catch (err) { logger.warn({ arquivo: f.name, err: err.message }, `${tag}: falha ao baixar`); continue; }
 
       const idade = agora - f.modifyTime;
+      const evento = lerEvento(xml);
+      if (evento) { eventos.push({ nome: f.name, caminho, ...evento }); continue; }
       if (!ehCte(xml) || !xmlCompleto(xml)) {
         if (idade > TTL_INVALIDO_MS) {
           await moverArquivo(sftp, caminho, DIR_ERRO, f.name, logger, tag);
@@ -270,6 +335,20 @@ async function processarPastaSftp(supabase, logger, fonte) {
       }
       arquivos.push({ nome: f.name, caminho, xml, chaves, idade });
     }
+
+    // Cancelamentos primeiro: limpa o que já está no banco e não grava CT-e
+    // cancelado que chegue nesta rodada (ou depois do seu evento).
+    const canceladas = await processarEventos(sftp, supabase, logger, cfg, eventos);
+    const descartarCancelado = async a => {
+      if (!canceladas.has(chaveCteDoXml(a.xml))) return true;
+      await moverArquivo(sftp, a.caminho, DIR_PROCESSADO, a.nome, logger, tag);
+      logger.info({ arquivo: a.nome }, `${tag}: CT-e cancelado — não gravado`);
+      return false;
+    };
+    const filtrar = async lista => { const ok = []; for (const a of lista) if (await descartarCancelado(a)) ok.push(a); return ok; };
+    arquivos = await filtrar(arquivos);
+    complementares = await filtrar(complementares);
+
     if (complementares.length) await processarComplementares(sftp, supabase, logger, cfg, complementares, arquivos);
     if (!arquivos.length) return 0;
 
